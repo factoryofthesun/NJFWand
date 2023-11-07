@@ -70,7 +70,7 @@ class UVLoss:
         # Ground truth
         if self.args.gtuvloss:
             # TODO: DOUBLE CHECK THAT VERTEX ORDER WITHIN FACES IS CORRECT OTHERWISE THIS MISMATCHES
-            gtuvloss = torch.nn.functional.mse_loss(uv.reshape(-1, 2), source.get_loaded_data('gt_uvs'), reduction='none')
+            gtuvloss = torch.nn.functional.mse_loss(uv, source.get_loaded_data('gt_uvs'), reduction='none')
             loss += torch.sum(gtuvloss)
             self.currentloss[self.count]['gtuvloss'] = np.mean(gtuvloss.detach().cpu().numpy(), axis=1)
 
@@ -91,7 +91,7 @@ class UVLoss:
         ## Stitching loss: can be vertex separation, edge separation, or gradient stitching
         ## Options: {l1/l2 distance}, {seamless transformation}, {weighting}
         if self.args.stitchingloss is not None:
-            edgesep, stitchingdict, weightdict = stitchingloss(vertices, faces, uv.reshape(-1, 2), self.args.stitchingloss, self.args,
+            edgesep, stitchingdict, weightdict = stitchingloss(vertices, faces, uv, self.args.stitchingloss, self.args,
                                                       stitchweights=stitchweights, source = source,
                                                       keepidxs = keepidxs)
             for k, v in stitchingdict.items():
@@ -104,7 +104,7 @@ class UVLoss:
         ### Distortion loss: can be ARAP or symmetric dirichlet
         distortionenergy = None
         if self.args.lossdistortion == "arap":
-            distortionenergy = arap(vertices, faces, uv, paramtris=uv,
+            distortionenergy = arap(vertices, faces, uv, paramtris = uv.reshape(-1, -1, 3, 2),
                                 device=self.device, renormalize=False,
                                 return_face_energy=True, timeit=False)
             self.currentloss[self.count]['distortionloss'] = distortionenergy.detach().cpu().numpy()

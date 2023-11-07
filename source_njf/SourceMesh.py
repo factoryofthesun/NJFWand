@@ -21,7 +21,7 @@ class SourceMesh:
     '''
 
     def __init__(self, args, source_ind, source_dir, extra_source_fields,
-                 random_scale, ttype, use_wks=False, random_centering=False,
+                 ttype, use_wks=False, random_centering=False,
                 cpuonly=False, init=False, fft=None, fftscale=None, flatten=False,
                 initjinput=False, debug=False, top_k_eig=50):
         self.args = args
@@ -36,7 +36,6 @@ class SourceMesh:
         self.__extra_keys = extra_source_fields
         self.__loaded_data = {}
         self.__ttype = ttype
-        self.__random_scale = random_scale
         self.random_centering = random_centering
         self.source_mesh_centroid = None
         self.mesh_processor = None
@@ -101,10 +100,6 @@ class SourceMesh:
         self.mesh_processor.prepare_differential_operators_for_use(self.__ttype) #call 1
         self.source_vertices = torch.from_numpy(self.mesh_processor.get_vertices()).type(
             self.__ttype)
-        if self.__random_scale != 1:
-            print("Diff ops and WKS need to be multiplied accordingly. Not implemented for now")
-            sys.exit()
-        self.source_vertices *= self.__random_scale
 
         bb = igl.bounding_box(self.source_vertices.numpy())[0]
         diag = igl.bounding_box_diagonal(self.source_vertices.numpy())
@@ -118,6 +113,9 @@ class SourceMesh:
         device = vertices.device
         faces = self.get_source_triangles()
         self.faces = torch.from_numpy(faces).long()
+
+        self.__loaded_data['vertices'] = self.source_vertices
+        self.__loaded_data['faces'] = self.faces
 
         #### PROCESS INPUT FEEATURES ####
         if self.args.arch == "diffusionnet":
@@ -377,20 +375,13 @@ class SourceMesh:
                     if torch.all(~torch.isnan(newtutte)):
                         self.tutteuv = newtutte
 
-                        # Convert Tutte to 3-dim
-                        self.tutteuv = torch.cat([self.tutteuv, torch.zeros(self.tutteuv.shape[0], self.tutteuv.shape[1], 1)], dim=-1)
-
                         # Get Jacobians
                         # souptutte = self.tutteuv.squeeze()[:,:2][self.cutfs,:].reshape(-1, 2)
                         # soupvs = torch.from_numpy(ogsoup.reshape(-1, 3)).to(device)
                         # soupfs = torch.from_numpy(np.arange(len(soupvs)).reshape(-1, 3)).to(device)
                         vs = torch.from_numpy(self.cutvs)
                         fs = torch.from_numpy(self.cutfs)
-                        self.tuttej = get_jacobian_torch(vs, fs, self.tutteuv.squeeze()[:,:2], device=device) # F x 2 x 3
-                        self.tuttej = torch.cat([self.tuttej, torch.zeros(self.tuttej.shape[0], 1, self.tuttej.shape[2])], dim=1)
-
-                        # self.tuttej = get_jacobian_torch(torch.from_numpy(mesh.vertices), torch.from_numpy(mesh.faces), self.tutteuv.squeeze()[:,:2], device=device) # F x 2 x 3
-                        # self.tuttej = torch.cat([self.tuttej, torch.zeros(self.tuttej.shape[0], 1, self.tuttej.shape[2])], dim=1)
+                        self.tuttej = get_jacobian_torch(vs, fs, self.tutteuv.squeeze(), device=device) # F x 2 x 3
 
                         if torch.any(~torch.isfinite(self.tuttej)):
                             print("Tutte Jacobians have NaNs!")
@@ -401,12 +392,8 @@ class SourceMesh:
                     if not set_new_tutte:
                         self.tutteuv = torch.from_numpy(tutte_embedding(vertices.detach().cpu().numpy(), faces)).unsqueeze(0) # 1 x V x 2
 
-                        # Convert Tutte to 3-dim
-                        self.tutteuv = torch.cat([self.tutteuv, torch.zeros(self.tutteuv.shape[0], self.tutteuv.shape[1], 1)], dim=-1)
-
                         # Get Jacobians
-                        self.tuttej = get_jacobian_torch(vertices, faces, self.tutteuv.squeeze()[:,:2], device=device) # F x 2 x 3
-                        self.tuttej = torch.cat([self.tuttej, torch.zeros(self.tuttej.shape[0], 1, self.tuttej.shape[2])], dim=1)
+                        self.tuttej = get_jacobian_torch(vertices, faces, self.tutteuv.squeeze(), device=device) # F x 2 x 3
 
                         # Reset cut topo to original topo
                         self.cutvs = vertices.detach().cpu().numpy()
@@ -443,10 +430,6 @@ class SourceMesh:
                     soupvs = torch.from_numpy(ogsoup.reshape(-1, 3))
                     soupfs = torch.arange(len(soupvs)).reshape(-1, 3)
                     self.tuttej = get_jacobian_torch(soupvs, soupfs, souptutte, device=device) # F x 2 x 3
-                    self.tuttej = torch.cat([self.tuttej, torch.zeros(self.tuttej.shape[0], 1, self.tuttej.shape[2])], dim=1)
-
-                    # Convert Tutte to 3-dim
-                    self.tutteuv = torch.cat([self.tutteuv, torch.zeros(self.tutteuv.shape[0], self.tutteuv.shape[1], 1)], dim=-1)
 
                     # Reset cut topo to original topo
                     self.cutvs = vertices.detach().cpu().numpy()
@@ -581,12 +564,8 @@ class SourceMesh:
                     if torch.all(~torch.isnan(newslim)):
                         self.slimuv = newslim
 
-                        # Convert slim to 3-dim
-                        self.slimuv = torch.cat([self.slimuv, torch.zeros(self.slimuv.shape[0], self.slimuv.shape[1], 1)], dim=-1)
-
                         # Get Jacobians
                         self.slimj = get_jacobian_torch(torch.from_numpy(self.cutvs), torch.from_numpy(self.cutfs), self.slimuv.squeeze()[:,:2], device=device) # F x 2 x 3
-                        self.slimj = torch.cat([self.slimj, torch.zeros(self.slimj.shape[0], 1, self.slimj.shape[2])], dim=1)
 
                         if torch.any(~torch.isfinite(self.slimj)):
                             print("SLIM Jacobians have NaNs!")
@@ -596,12 +575,8 @@ class SourceMesh:
                     if not set_new_slim:
                         self.slimuv = torch.from_numpy(SLIM(ogmesh, iters=self.args.slimiters)[0]).unsqueeze(0) # 1 x V x 2
 
-                        # Convert slim to 3-dim
-                        self.slimuv = torch.cat([self.slimuv, torch.zeros(self.slimuv.shape[0], self.slimuv.shape[1], 1)], dim=-1)
-
                         # Get Jacobians
                         self.slimj = get_jacobian_torch(vertices, faces, self.slimuv.squeeze()[:,:2], device=device) # F x 2 x 3
-                        self.slimj = torch.cat([self.slimj, torch.zeros(self.slimj.shape[0], 1, self.slimj.shape[2])], dim=1)
 
                         # Reset cut topo to original topo
                         self.cutvs = vertices.detach().cpu().numpy()
@@ -626,10 +601,6 @@ class SourceMesh:
 
                     # Get Jacobians
                     self.slimj = get_jacobian_torch(vertices, faces, self.slimuv.squeeze()[:,:2], device=device) # F x 2 x 3
-                    self.slimj = torch.cat([self.slimj, torch.zeros(self.slimj.shape[0], 1, self.slimj.shape[2])], dim=1)
-
-                    # Convert slim to 3-dim
-                    self.slimuv = torch.cat([self.slimuv, torch.zeros(self.slimuv.shape[0], self.slimuv.shape[1], 1)], dim=-1)
 
                     # Reset cut topo to original topo
                     self.cutvs = vertices.detach().cpu().numpy()
@@ -844,21 +815,6 @@ class SourceMesh:
                 else:
                     self.input_features = torch.cat([self.input_features, torch.stack([self.initweights] * self.input_features.shape[0], dim=0).to(self.input_features.device)], dim=1)
 
-        ### Dense: Use initialization jacobians as input
-        if self.flatten == "input":
-            if self.init == "tutte":
-                self.flat_vector = self.tuttej.reshape(1, -1)
-            elif self.init == "isometric":
-                self.flat_vector = torch.cat([self.isoj, torch.zeros((self.isoj.shape[0], 1, 3))], dim=1).reshape(1, -1)
-            elif self.init == "slim":
-                self.flat_vector = self.slimj.reshape(1, -1)
-            # nchannels = self.input_features.shape[1]
-            # gsize = int(np.ceil(nchannels/9))
-            # newchannels = []
-            # for i in range(9):
-            #     newchannels.append(torch.sum(self.input_features[:,i*gsize:(i+1)*gsize], dim=1))
-            # self.flat_vector = torch.stack(newchannels, dim=1).reshape(1, -1)
-
         # Essentially here we load pointnet data and apply the same preprocessing
         for key in self.__extra_keys:
             data = self.mesh_processor.get_data(key)
@@ -868,12 +824,9 @@ class SourceMesh:
             if key == 'samples':
                 if self.center_source:
                     data -= self.get_mesh_centroid()
-                scale = self.__random_scale
-                data *= scale
             data = data.unsqueeze(0).type(self.__ttype)
 
             self.__loaded_data[key] = data
-        # print("Ellapsed load source mesh ", time.time() - start)
 
     def load(self, source_v=None, source_f=None, new_init=False):
         if source_v is not None and source_f is not None:

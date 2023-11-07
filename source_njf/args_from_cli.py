@@ -24,10 +24,10 @@ def get_arg_parser():
 						type = str, required=True)
 	parser.add_argument("--root_dir_train",
 						help='location of the root dir to get data from',
-						type = str,default=None)
+						type = str,default="")
 	parser.add_argument("--root_dir_test",
 						help='location of the root dir to get data from',
-						type = str,default=None)
+						type = str,default="")
 	parser.add_argument("--version",
 						help='version no',
 						type = int, default=0)
@@ -89,6 +89,7 @@ def get_arg_parser():
 						help=f"maximal number of target deformations per batch, default is 16",type=int,default=1)
 	parser.add_argument("--sources_per_batch",
 						help=f"maximal number of sources (each with its own deformation set) per batch, default is 1", type=int, default=1)
+	parser.add_argument("--batch_size", type=int, default=1)
 	parser.add_argument( "--workers",
 						help=f"number of worker threads for dataloading, default is 8",
 						type=int, default=8)
@@ -199,8 +200,6 @@ def get_arg_parser():
 	parser.add_argument("--xp_type", help ="only runs the validation",default=None,type=str)
 	parser.add_argument("--test", help="run in test mode", action="store_true")
 	parser.add_argument("--statsonly", help="applies only to test time, only write stats, no viz", action="store_true")
-	parser.add_argument("--random_scale",help="randomly scale the source (source), target (target), both each with their own random scale (both), both with "
-												"the same scale each time (same), or none (none = default)",type=str,default='none',choices={'source','target','both','same','none'})
 	parser.add_argument("--test_set",help="which set to run test on [valid],train,all",type=str,default='valid',choices={'valid','train','all'})
 	parser.add_argument('--only_final_stats',help= "during test time, only aggregate the final stats", action="store_true")
 	parser.add_argument('--checkpoint_often',help="save checkpoint more often (every 1000 steps)",action='store_true')
