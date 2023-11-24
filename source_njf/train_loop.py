@@ -13,6 +13,7 @@ from results_saving_scripts import save_mesh_with_uv
 from UVDataset import UVDataset
 from torch.utils.data import DataLoader
 from torch import nn
+from torch.nn.functional import pad
 import torch
 import PerCentroidBatchMaker
 import MeshProcessor
@@ -206,14 +207,24 @@ class MyNet(pl.LightningModule):
 		:param single_source_batch: the batch
 		:return:BxTx3x3 OR BxTx2x2
 		'''
-        if self.args.dense:
-            stacked = torch.stack([source.flat_vector for source in source_batch])
-        elif codes is None:
-            stacked = torch.stack([source.get_input_features() for source in source_batch])
+        # if self.args.dense:
+        #     stacked = torch.stack([source.flat_vector for source in source_batch])
+        # Need to get max feature, vertex, and face counts to pad batch
+        max_features = 0
+        max_faces = 0
+        max_verts = 0
+        max_edges = 0
+        for source in source_batch:
+            max_features = max(max_features, len(source.get_input_features()))
+            max_faces = max(max_faces, len(source.faces))
+            max_verts = max(max_verts, len(source.vertices))
+            max_edges = max(max_edges, len(source.ogedge_vpairs_nobound))
+        if codes is None:
+            stacked = torch.stack([pad(source.get_input_features(), (0, 0, 0, max_features - len(source.get_input_features()))) for source in source_batch])
         else:
             # NOTE: Codes should be dim B x V x C
             # TODO: Need 0 padding for batched shapes w/ different vertex counts
-            stacked = torch.cat([torch.stack([source.get_input_features() for source in source_batch]), codes], dim=2)
+            stacked = torch.cat([torch.stack([pad(source.get_input_features(), (0, 0, 0, max_features - len(source.get_input_features()))) for source in source_batch]), codes], dim=2)
 
         # feed the 2D tensor through the network
         res = self.forward(stacked, source_batch)
@@ -233,9 +244,9 @@ class MyNet(pl.LightningModule):
                     source = source_batch[sourcei]
                     faces = source.get_source_triangles()
                     edge_vpairs_nobound = source.ogedge_vpairs_nobound
-                    facecodes.append(torch.mean(vertexcodes[sourcei, faces,:], dim=1))
-                    edgecodes.append(torch.mean(vertexcodes[sourcei, edge_vpairs_nobound,:], dim=1))
-                    initweights.append(source.initweights.to(vertexcodes.device))
+                    facecodes.append(pad(torch.mean(vertexcodes[sourcei, faces,:], dim=1), (0, 0, 0, max_faces - len(faces))))
+                    edgecodes.append(pad(torch.mean(vertexcodes[sourcei, edge_vpairs_nobound,:], dim=1), (0, 0, 0, max_edges - len(edge_vpairs_nobound))))
+                    initweights.append(pad(source.initweights.to(vertexcodes.device), (0, 0, 0, max_edges - len(edge_vpairs_nobound))))
 
                 facecodes = torch.stack(facecodes)
                 edgecodes = torch.stack(edgecodes)
@@ -270,7 +281,7 @@ class MyNet(pl.LightningModule):
                         assert len(weights) == len(source.edge_vpairs), f"weights len: {len(weights)}, edge vpairs len: {len(source.edge_vpairs)}"
                     else:
                         assert len(weights) == len(source.valid_pairs), f"weights len: {len(weights)}, valid pairs len: {len(source.valid_pairs)}"
-                    weights.append(-facesim)
+                    weights.append(pad(-facesim, (0, 0, 0, max_edges - len(facepairs))))
 
                 weights = torch.stack(weights)
                 res = res[:, :, :self.jdim]
@@ -559,9 +570,11 @@ class MyNet(pl.LightningModule):
                                                 source.poisson.lap_pinned_rows, source.poisson.lap_pinned_cols)
                 updatedlap = True
 
-            pred_V.append(source.vertices_from_jacobians(pred_J, updatedlap = updatedlap))
-            pred_J_poiss.append(source.poisson.jacobians_from_vertices(pred_V))
-            pred_J_restricted_poiss.append(source.restrict_jacobians(pred_J))
+            pred_J_i = pred_J[[sourcei], :len(source.faces)]
+            pred_V_i = source.vertices_from_jacobians(pred_J_i, updatedlap = updatedlap)
+            pred_V.append(pred_V_i)
+            pred_J_poiss.append(source.poisson.jacobians_from_vertices(pred_V_i))
+            pred_J_restricted_poiss.append(source.restrict_jacobians(pred_J_i))
 
         pred_V = torch.stack(pred_V)
         pred_J_poiss = torch.stack(pred_J_poiss)
@@ -957,9 +970,8 @@ class MyNet(pl.LightningModule):
         # 		GT_V = batches.get_batch(0).poisson.solve_poisson(GTT)
 
         # Composite the input features
+        max_faces = max([len(source.faces) for source in source_batch])
         initj = []
-        vertices = []
-        faces = []
         for source in source_batch:
             source.to(self.device)
 
@@ -974,15 +986,9 @@ class MyNet(pl.LightningModule):
             elif self.args.init == "slim":
                 initj.append(source.slimj.squeeze().to(self.device))
 
-            # Need to export mesh soup to get correct face to tutte uv indexing
-            mesh = Mesh(source.get_vertices().detach().cpu().numpy(), source.get_source_triangles())
-            vs, fs, es = mesh.export_soup()
-            vertices.append(torch.from_numpy(vs).float().to(self.device))
-            faces.append(torch.from_numpy(fs).long().to(self.device))
+            initj[-1] = pad(initj[-1], (0, 0, 0, 0, 0, max_faces - len(source.faces)), value=0)
 
         initj = torch.stack(initj)
-        vertices = torch.stack(vertices)
-        faces = torch.stack(faces)
 
         if self.args.softpoisson or self.args.optweight:
             pred_V, pred_J, pred_J_poiss, pred_J_restricted_poiss, weights = self.predict_map(source_batch, initj=initj if initj is not None else None)
@@ -1010,7 +1016,8 @@ class MyNet(pl.LightningModule):
         for sourcei in range(len(source_batch)):
             source = source_batch[sourcei]
             loss[sourcei] = self.lossfcn.computeloss(source.get_loaded_data('vertices'), source.get_loaded_data('faces'),
-                                             ZeroNanGrad.apply(pred_V[sourcei]), ZeroNanGrad.apply(pred_J_poiss[sourcei]),
+                                             ZeroNanGrad.apply(pred_V[sourcei, :len(source.vertices)]),
+                                             ZeroNanGrad.apply(pred_J_poiss[sourcei, :len(source.faces)]),
                                             weights=weights[sourcei], source=source, keepidxs=source.keepidxs)
 
         lossrecord = self.lossfcn.exportloss()
@@ -1038,10 +1045,8 @@ class MyNet(pl.LightningModule):
 
         # Consolidate all stuff
         batchlen = len(source_batch)
-        vertices = vertices.detach().cpu().numpy()
         pred_V = pred_V.detach().cpu().numpy()
         pred_J = pred_J.detach().cpu().numpy()
-        faces = faces.detach().cpu().numpy()
         weights = weights.detach().cpu().numpy()
         total_loss = torch.sum(loss)
 
@@ -1057,10 +1062,10 @@ class MyNet(pl.LightningModule):
                 lossdict[key].append(val)
 
         ret = {
-            'source_V': [vertices.detach().cpu().numpy()],
+            'source_V': [source.vertices.detach().cpu().numpy() for source in source_batch],
             'pred_V': [pred_V[sourcei, :vlen[sourcei]] for sourcei in range(batchlen)],
             'pred_J': [pred_J[sourcei, :flen[sourcei]] for sourcei in range(batchlen)],
-            'ogT': [faces[sourcei, :flen[sourcei]] for sourcei in range(batchlen)],
+            'ogT': [source.faces.detach().cpu().numpy() for source in source_batch],
             'T': [np.arange(flen[sourcei] * 3).reshape(-1, 3) for sourcei in range(batchlen)],
             'source_ind': [source.source_ind for source in source_batch],
             "loss": total_loss,

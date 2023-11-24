@@ -95,7 +95,7 @@ class UVLoss:
                                                       stitchweights=stitchweights, source = source,
                                                       keepidxs = keepidxs)
             for k, v in stitchingdict.items():
-                self.currentloss[self.count][k] = v.detach().cpu().numpy()
+                self.currentloss[self.count][k] = weightdict[k] * v.detach().cpu().numpy()
                 loss += weightdict[k] * torch.sum(v)
 
             # Edge sep always goes into lossdict for visualization purposes

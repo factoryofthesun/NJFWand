@@ -78,8 +78,8 @@ def get_arg_parser():
 							action="store_true")
 
 	parser.add_argument("--simplecut", help="enforce single boundary cut", action="store_true")
-	parser.add_argument("--min_cuts", type=int, help="minimum # cuts for tutte init", default=5)
-	parser.add_argument("--max_cuts", type=int, help="maximum # cuts for tutte init", default=15)
+	parser.add_argument("--min_cuts", type=int, help="minimum # cuts for tutte init", default=0)
+	parser.add_argument("--max_cuts", type=int, help="maximum # cuts for tutte init", default=0)
 
 	parser.add_argument("--no_vertex_loss", help="use source/target vertex l2 loss",
 						action="store_true")
