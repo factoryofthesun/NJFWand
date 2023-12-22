@@ -65,14 +65,14 @@ def tutte_embedding(vertices, faces):
         raise ValueError(f"tutte_embedding: mesh has no boundary! set fixclosed = True to try to cut to disk topology.")
 
     ## Map the boundary to a circle, preserving edge proportions
-    bnd_uv = igl.map_vertices_to_circle(vertices, bnd)
+    bnd_uv = igl.map_vertices_to_circle(vertices, bnd).astype(vertices.dtype)
 
     ## Harmonic parametrization for the internal vertices
     assert not np.isnan(bnd).any(), f"NaN found in boundary loop!"
     assert not np.isnan(bnd_uv).any(), f"NaN found in tutte initialized UVs!"
-    uv_init = igl.harmonic_weights(vertices, faces, bnd, np.array(bnd_uv, dtype=vertices.dtype), 1)
+    uv_init = igl.harmonic(vertices, faces, bnd, bnd_uv, 1)
 
-    return uv_init
+    return uv_init, bnd, bnd_uv
 
 # Convert each triangle into local coordinates: A -> (0,0), B -> (x2, 0), C -> (x3, y3)
 # TODO: general projection onto local bases
@@ -991,7 +991,7 @@ def SLIM(mesh, iters=500, v_with_holes = None, f_with_holes = None):
     from meshing.mesh import Mesh
 
     vs, fs, _ = mesh.export_soup()
-    uv_init = tutte_embedding(vs, fs)
+    uv_init, bnd, bnd_uv = tutte_embedding(vs, fs)
 
     # Need to subset back non-disk topology if filled hole
     if v_with_holes is not None and f_with_holes is not None:
@@ -1002,7 +1002,7 @@ def SLIM(mesh, iters=500, v_with_holes = None, f_with_holes = None):
         submesh = Mesh(uv_init, sub_faces)
         vs, fs, _ = submesh.export_soup()
 
-    slim = igl.SLIM(vs, fs, uv_init, np.ones((1,1)),np.expand_dims(uv_init[0,:],0), igl.SLIM_ENERGY_TYPE_SYMMETRIC_DIRICHLET, 1.0e1)
+    slim = igl.SLIM(vs, fs, uv_init, bnd, bnd_uv, igl.SLIM_ENERGY_TYPE_ARAP, 0.0)
     slim.solve(iters)
     slim_uv = slim.vertices()
     slim_uv -= slim_uv.mean(axis = 0)

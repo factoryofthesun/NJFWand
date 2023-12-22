@@ -96,9 +96,9 @@ class Mesh:
                 for i in range(len(faces)):
                     face = faces[i]
                     f.write(f"f {face[0]+1:d} {face[1]+1:d} {face[2]+1:d}\n")
-            for edge in edges[:-1]:
-                f.write("e %d %d\n" % (edge[0] + 1, edge[1] + 1))
-            f.write("e %d %d\n" % (edges[-1][0] + 1, edges[-1][1] + 1))
+            # for edge in edges[:-1]:
+            #     f.write("e %d %d\n" % (edge[0] + 1, edge[1] + 1))
+            # f.write("e %d %d\n" % (edges[-1][0] + 1, edges[-1][1] + 1))
 
     # Return vertices and face connectivities associated with input faces
     def export_submesh(self, face_inds):
