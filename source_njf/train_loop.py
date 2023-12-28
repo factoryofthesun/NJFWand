@@ -60,11 +60,46 @@ class MyNet(pl.LightningModule):
         if not hasattr(args, "lossgt"):
             args.lossgt = False
 
+        # HACK: intersectionloss
+        if not hasattr(args, "intersectionloss"):
+            args.intersectionloss = False
+
         self.lossfcn = UVLoss(args, self.device)
 
         # NOTE: code dim refers to the pointnet encoding. Point_dim is centroid position (also potentially fourier features)
         layer_normalization = self.get_layer_normalization_type()
-        if self.args.softpoisson:
+
+        if self.args.directuv:
+            # Arch for direct UV prediction (NO SP): two diffusionnets => vertex + face encoder => MLP decoder for UVs
+            # TODO: Condition on initial UVs => positional encoding on init UVs MAYBE
+            input_dim = point_dim + code_dim
+
+            from diffusionnet import DiffusionNet
+            self.vertexencoder = DiffusionNet(C_in=input_dim, C_out=self.args.vertexdim, C_width=128, N_block=4, outputs_at='vertices',
+                                            with_gradient_features=True, with_gradient_rotations=True)
+            self.faceencoder = DiffusionNet(C_in=input_dim, C_out=self.args.facedim, C_width=128, N_block=4, outputs_at='faces',
+                                            with_gradient_features=True, with_gradient_rotations=True)
+
+            encoderdim = self.args.vertexdim + self.args.facedim
+
+            if self.args.init:
+                encoderdim += 2
+
+            self.uvdecoder = nn.Sequential(nn.Linear(encoderdim, 128),
+                                        nn.ReLU(),
+                                        nn.Linear(128, 256),
+                                        nn.ReLU(),
+                                        nn.Linear(256, 128),
+                                        nn.ReLU(),
+                                        nn.Linear(128, 2),
+                                        )
+
+            # TODO: Does this fk our gradients??
+            # Initialize uv decoder weights to 0
+            # self.uvdecoder[-1].bias.data.zero_()
+            # self.uvdecoder[-1].weight.data.zero_()
+
+        elif self.args.softpoisson:
             assert face_dim > 0, f"face_dim must be > 0 for soft poisson. face_dim: {face_dim}."
 
             # TODO: INPUT DIM IS DIFFERENT FOR DIFFUSIONNET (NEED VERTEX FEATURES)
@@ -77,16 +112,16 @@ class MyNet(pl.LightningModule):
                 from diffusionnet import DiffusionNet
                 vertexdim = self.args.vertexdim
                 self.vertexencoder = DiffusionNet(C_in=input_dim, C_out=self.args.vertexdim, C_width=128, N_block=4, outputs_at='vertices',
-                                                  with_gradient_features=True, with_gradient_rotations=True)
+                                                with_gradient_features=True, with_gradient_rotations=True)
                 face_decoder_dim = 9
                 edge_decoder_dim = 1
                 self.edge_decoder = nn.Sequential(nn.Linear(self.args.vertexdim, 128),
                                             nn.ReLU(),
-                                            nn.Linear(128, 64),
+                                            nn.Linear(128, 256),
                                             nn.ReLU(),
-                                            nn.Linear(64, 32),
+                                            nn.Linear(256, 128),
                                             nn.ReLU(),
-                                            nn.Linear(32, edge_decoder_dim),
+                                            nn.Linear(128, edge_decoder_dim),
                                             )
 
                 # Initialize edge weights to 0
@@ -96,36 +131,35 @@ class MyNet(pl.LightningModule):
                 self.face_decoder = nn.Sequential(nn.Linear(self.args.vertexdim, 128),
                                             # nn.GroupNorm(num_groups=4, num_channels=128), # , eps=0.0001 I have considered increasing this value in case we have channels from pointnet with the same values.
                                             nn.ReLU(),
-                                            nn.Linear(128, 64),
+                                            nn.Linear(128, 256),
                                             # nn.GroupNorm(num_groups=4, num_channels=128), # , eps=0.0001 I have considered increasing this value in case we have channels from pointnet with the same values.
                                             nn.ReLU(),
-                                            nn.Linear(64, 32),
+                                            nn.Linear(256, 128),
                                             # nn.GroupNorm(num_groups=4, num_channels=128),
                                             nn.ReLU(),
-                                            nn.Linear(32, face_decoder_dim),
+                                            nn.Linear(128, face_decoder_dim),
                                             )
 
                 self.__IDENTITY_INIT = self.args.identity
                 if self.__IDENTITY_INIT:
                     self.face_decoder[-1].bias.data.zero_()
                     self.face_decoder[-1].weight.data.zero_()
-
             ## TODO
             elif self.arch == "attention":
                 pass
 
             elif self.arch == "mlp":
                 self.face_decoder = nn.Sequential(nn.Linear(input_dim, 128),
-                                                    nn.GroupNorm(num_groups=4, num_channels=128), # , eps=0.0001 I have considered increasing this value in case we have channels from pointnet with the same values.
+                                                    # nn.GroupNorm(num_groups=4, num_channels=128), # , eps=0.0001 I have considered increasing this value in case we have channels from pointnet with the same values.
                                                     nn.ReLU(),
                                                     nn.Linear(128, 128),
-                                                    nn.GroupNorm(num_groups=4, num_channels=128), # , eps=0.0001 I have considered increasing this value in case we have channels from pointnet with the same values.
+                                                    # nn.GroupNorm(num_groups=4, num_channels=128), # , eps=0.0001 I have considered increasing this value in case we have channels from pointnet with the same values.
                                                     nn.ReLU(),
                                                     nn.Linear(128, 128),
-                                                    nn.GroupNorm(num_groups=4, num_channels=128),
+                                                    # nn.GroupNorm(num_groups=4, num_channels=128),
                                                     nn.ReLU(),
                                                     nn.Linear(128, 128),
-                                                    nn.GroupNorm(num_groups=4, num_channels=128),
+                                                    # nn.GroupNorm(num_groups=4, num_channels=128),
                                                     nn.ReLU(),
                                                     nn.Linear(128, output_dim))
                 # Initialize the last layer sparsely
@@ -162,51 +196,6 @@ class MyNet(pl.LightningModule):
                                                     nn.ReLU(),
                                                     nn.Linear(channels, channels),
                                                     )
-        elif layer_normalization == "IDENTITY":
-            # print("Using IDENTITY (no normalization) in face_decoder!")
-            self.face_decoder = nn.Sequential(nn.Linear(point_dim + code_dim, 128),
-                                                  nn.Identity(),
-                                                  nn.ReLU(),
-                                                  nn.Linear(128, 128),
-                                                  nn.Identity(),
-                                                  nn.ReLU(),
-                                                  nn.Linear(128, 128),
-                                                  nn.Identity(),
-                                                  nn.ReLU(),
-                                                  nn.Linear(128, 128),
-                                                  nn.Identity(),
-                                                  nn.ReLU(),
-                                                  nn.Linear(128, 9))
-        elif layer_normalization == "BATCHNORM":
-            # print("Using BATCHNORM in face_decoder!")
-            self.face_decoder = nn.Sequential(nn.Linear(point_dim + code_dim, 128),
-                                                  nn.BatchNorm1d(128),
-                                                  nn.ReLU(),
-                                                  nn.Linear(128, 128),
-                                                  nn.BatchNorm1d(128),
-                                                  nn.ReLU(),
-                                                  nn.Linear(128, 128),
-                                                  nn.BatchNorm1d(128),
-                                                  nn.ReLU(),
-                                                  nn.Linear(128, 128),
-                                                  nn.BatchNorm1d(128),
-                                                  nn.ReLU(),
-                                                  nn.Linear(128, 9))
-        elif layer_normalization == "GROUPNORM_CONV":
-            # print("Using GROUPNORM2 in face_decoder!")
-            self.face_decoder = nn.Sequential(nn.Conv1d(point_dim + code_dim, 128, 1),
-                                                  nn.GroupNorm(num_groups=4, num_channels=128),
-                                                  nn.ReLU(),
-                                                  nn.Conv1d(128, 128, 1),
-                                                  nn.GroupNorm(num_groups=4, num_channels=128),
-                                                  nn.ReLU(),
-                                                  nn.Conv1d(128, 128, 1),
-                                                  nn.GroupNorm(num_groups=4, num_channels=128),
-                                                  nn.ReLU(),
-                                                  nn.Conv1d(128, 128, 1),
-                                                  nn.GroupNorm(num_groups=4, num_channels=128),
-                                                  nn.ReLU(),
-                                                  nn.Conv1d(128, 9, 1))
         elif layer_normalization == "GROUPNORM":
             # print("Using GROUPNORM in face_decoder!")
             self.face_decoder = nn.Sequential(nn.Linear(point_dim + code_dim, 128),
@@ -278,10 +267,19 @@ class MyNet(pl.LightningModule):
         if self.arch == 'mlp':
             return self.face_decoder(x)
         elif self.arch == 'diffusionnet':
-            return self.vertexencoder(x, source.get_loaded_data('mass'), L=source.get_loaded_data('L'),
+            if self.args.directuv:
+                return self.vertexencoder(x, source.get_loaded_data('mass'), L=source.get_loaded_data('L'),
+                                      evals=source.get_loaded_data('evals'), evecs=source.get_loaded_data('evecs'),
+                                      gradX=source.get_loaded_data('gradX'), gradY=source.get_loaded_data('gradY'),
+                                      faces=source.get_loaded_data('faces')), self.faceencoder(x, source.get_loaded_data('mass'), L=source.get_loaded_data('L'),
                                       evals=source.get_loaded_data('evals'), evecs=source.get_loaded_data('evecs'),
                                       gradX=source.get_loaded_data('gradX'), gradY=source.get_loaded_data('gradY'),
                                       faces=source.get_loaded_data('faces'))
+            else:
+                return self.vertexencoder(x, source.get_loaded_data('mass'), L=source.get_loaded_data('L'),
+                                        evals=source.get_loaded_data('evals'), evecs=source.get_loaded_data('evecs'),
+                                        gradX=source.get_loaded_data('gradX'), gradY=source.get_loaded_data('gradY'),
+                                        faces=source.get_loaded_data('faces'))
 
     def predict_jacobians(self, source, target):
         '''
@@ -338,8 +336,14 @@ class MyNet(pl.LightningModule):
                 weights = -torch.sigmoid(edgevals + source.initweights.to(edgevals.device))
             # Softmax the weights
             elif self.args.spweight == "softmax":
-                weights = torch.softmax(edgevals + source.initweights.to(edgevals.device), dim=0) * len(edgevals) # Normalize by number of weights
+                weights = torch.softmax(edgevals + source.initweights.to(edgevals.device), dim=0)
+
+                # Rescale just to make viz easier (not necessary for soft poisson to work)
+                weights = weights / torch.max(weights).detach()
                 weights = -weights
+
+            elif self.args.spweight == "nonzero":
+                weights = -dclamp(edgevals + source.initweights.to(edgevals.device), 1e-9, 10000)
 
         # TODO: take SA-computed face latents => cosine similarity => dclamp(-2, 2) => add 1 div 2 (0 - 1 scaling)
         #                                     => face decoder MLP => jacobians
@@ -354,15 +358,19 @@ class MyNet(pl.LightningModule):
             if self.args.spweight == "sigmoid":
                 facedot = torch.sum(facelatents[facepairs[:,0]] * facelatents[facepairs[:,1]], dim=1)
                 facesim = torch.sigmoid(facedot + source.initweights.to(facedot.device))
-            elif self.args.spweight == "seamless":
+            elif self.args.spweight == "nonzero":
                 facedot = torch.sum(facelatents[facepairs[:,0]] * facelatents[facepairs[:,1]], dim=1)
-                facesim = (facedot + source.initweights.to(facedot.device))**2/((facedot + source.initweights.to(facedot.device))**2 + self.args.seamlessdelta)
+                weights = -dclamp(facedot + source.initweights.to(edgevals.device), 1e-7, 1)
             elif self.args.spweight == "cosine":
                 facesim = dclamp(torch.nn.functional.cosine_similarity(facelatents[facepairs[:,0]], facelatents[facepairs[:,1]]) \
                                 + source.initweights.to(facelatents.device), 1e-7, 1)
             elif self.args.spweight == "softmax":
                 facedot = torch.sum(facelatents[facepairs[:,0]] * facelatents[facepairs[:,1]], dim=1)
-                facesim = torch.softmax(facedot + source.initweights.to(facedot.device)) * len(facesim)
+                facesim = torch.softmax(facedot + source.initweights.to(facedot.device))
+
+                # Rescale just to make viz easier (not necessary for soft poisson to work)
+                with torch.no_grad():
+                    weights = weights/torch.max(weights)
             else:
                 raise Exception(f"Unknown soft poisson weight type: {self.args.spweight}.")
             weights = -facesim
@@ -598,6 +606,9 @@ class MyNet(pl.LightningModule):
             if "loss" in key:
                 self.log(key, np.mean(val), logger=True, prog_bar=False, batch_size=1, on_epoch=True, on_step=False)
 
+        # TODO: Plot training losses as well
+
+
         if self.args.mem:
             # Check memory consumption
             # Get GPU memory usage
@@ -619,7 +630,7 @@ class MyNet(pl.LightningModule):
         self.log("lr", self.trainer.optimizers[0].param_groups[0]['lr'], prog_bar=False, logger=True, batch_size=1)
 
     def test_step(self, batch, batch_idx):
-        return self.my_step(batch, batch_idx)
+        return self.validation_step(batch, batch_idx)
 
     def get_gt_map(self, source, target, softpoisson=False):
         GT_V = target.get_vertices()
@@ -628,6 +639,28 @@ class MyNet(pl.LightningModule):
         GT_J = source.jacobians_from_vertices(GT_V)
         GT_J_restricted = source.restrict_jacobians(GT_J)
         return GT_V, GT_J, GT_J_restricted
+
+    def predict_uv(self, source, target, initfuv = None):
+        stacked = source.get_input_features()
+        vertexz, facez = self.forward(stacked, source)
+
+        # Concat vertex and face codes based on soup topology
+        # NOTE: must be in order of vs[fs].reshape(-1, 2) (i.e. fvs)
+        faces = source.get_loaded_data('faces')
+        vertexcodes = vertexz[faces].reshape(-1, vertexz.shape[1])
+        vertexcodes = torch.cat([vertexcodes, torch.repeat_interleave(facez, 3, dim = 0)], dim=1)
+
+        # Condition on initfuvs if given
+        if initfuv is not None:
+            vertexcodes = torch.cat([vertexcodes, initfuv.reshape(-1, 2)], dim=1)
+
+        pred_uvs = self.uvdecoder(vertexcodes).squeeze() # F * 3 x 2
+
+        # Delta against initial UVs (must be fuv format)
+        if self.args.init and initfuv is not None:
+            pred_uvs = pred_uvs + initfuv.reshape(-1, 2)
+
+        return pred_uvs
 
     def predict_map(self, source, target, initj=None):
         if self.args.softpoisson or self.args.optweight:
@@ -700,6 +733,7 @@ class MyNet(pl.LightningModule):
             return val_loss
 
         ### Visualizations
+        import matplotlib.pyplot as plt
 
         # Log path
         source, target = batch
@@ -723,14 +757,12 @@ class MyNet(pl.LightningModule):
             Path(save_path).mkdir(exist_ok=True, parents=True)
 
         # Save latest predictions
-        np.save(os.path.join(self.logger.save_dir, f"latest_preduv.npy"), batch_parts['pred_V'].squeeze().detach().cpu().numpy())
-        np.save(os.path.join(self.logger.save_dir, f"latest_predw.npy"), batch_parts['weights'])
+        np.save(os.path.join(self.logger.save_dir, f"latest_preduv_{batch_idx}.npy"), batch_parts['pred_V'].squeeze().detach().cpu().numpy())
+        np.save(os.path.join(self.logger.save_dir, f"latest_predt_{batch_idx}.npy"), batch_parts['T'])
 
-        # if self.args.opttrans:
-        #     np.save(os.path.join(self.logger.save_dir, f"latest_preduv.npy"), batch_parts['pred_V_opttrans'].squeeze().detach().cpu().numpy())
-
-        np.save(os.path.join(self.logger.save_dir, f"latest_predt.npy"), batch_parts['T'])
-        np.save(os.path.join(self.logger.save_dir, f"latest_predj.npy"), batch_parts["pred_J"].squeeze().detach().cpu().numpy())
+        if self.args.softpoisson:
+            np.save(os.path.join(self.logger.save_dir, f"latest_predw_{batch_idx}.npy"), batch_parts['weights'])
+            np.save(os.path.join(self.logger.save_dir, f"latest_predj_{batch_idx}.npy"), batch_parts["pred_J"].squeeze().detach().cpu().numpy())
 
         # if self.args.no_poisson:
         #     np.save(os.path.join(source_path, f"latest_poissonuv.npy"), batch_parts['poissonUV'].squeeze().detach().cpu().numpy())
@@ -740,7 +772,6 @@ class MyNet(pl.LightningModule):
         if self.args.xp_type == "uv":
             # Plot the histogram of weights
             if self.args.softpoisson or self.args.optweight:
-                import matplotlib.pyplot as plt
                 fig, axs = plt.subplots()
                 # plot ours
                 axs.set_title(f"Epoch {self.current_epoch:05}: SP Weights")
@@ -751,9 +782,36 @@ class MyNet(pl.LightningModule):
                 self.logger.log_image(key='weights', images=[os.path.join(save_path, f"weights_epoch_{self.current_epoch:05}_batch{batch_idx}.png")],
                                       step=self.current_epoch)
 
+            # Texture images
+            # Save rendered images for debugging
+            if self.args.sdsloss:
+                import matplotlib.pyplot as plt
+
+                images = batch_parts['textureimgs']
+                num_views = 5
+                fig, axs = plt.subplots(int(np.ceil(num_views/5)), num_views)
+                for nview in range(num_views):
+                    j = nview % 5
+                    if nview > 5:
+                        i = nview // 5
+                        axs[i,j].imshow(images[nview].transpose(1,2,0))
+                        axs[i,j].axis('off')
+                    else:
+                        axs[j].imshow(images[nview].transpose(1,2,0))
+                        axs[j].axis('off')
+                plt.axis('off')
+                fig.suptitle(f"Epoch {self.current_epoch} Textures")
+                plt.savefig(os.path.join(save_path, f"{self.current_epoch:05}_{source.source_ind}_texture.png"))
+                plt.close(fig)
+                plt.cla()
+
+                # Log the plotted imgs
+                images = [os.path.join(save_path, f"{self.current_epoch:05}_{source.source_ind}_texture.png")]
+                self.logger.log_image(key='textures', images=images, step=self.current_epoch)
+
             # NOTE: batch_parts['T'] = triangle soup indexing if no poisson solve
             # If recutting Tutte: then plot the original tutte uvs
-            if (self.args.init in ["tutte", 'slim'] and self.args.ninit == -1) or \
+            if (self.args.init in ["tutte", 'slim', 'isometric', 'precut'] and self.args.ninit == -1) or \
                 (self.current_epoch == 0 and self.args.init):
                 source = batch[0]
                 if self.args.init == "tutte":
@@ -762,9 +820,14 @@ class MyNet(pl.LightningModule):
                 elif self.args.init == "slim":
                     uv = source.slimuv
                     uvfs = source.cutfs
-                else:
+                elif self.args.init == "isometric":
                     uv = source.isofuv.reshape(-1, 2)
                     uvfs = np.arange(len(uv)).reshape(-1, 3)
+                elif self.args.init == "precut":
+                    uv = source.preuv.squeeze()
+                    uvfs = np.arange(len(uv)).reshape(-1, 3)
+                else:
+                    raise ValueError(f"Unknown init type: {self.args.init}")
 
                 plot_uv(save_path, f"{self.args.init} init epoch {self.current_epoch:05} batch {batch_idx}", uv.squeeze().detach().cpu().numpy(),
                         uvfs, losses=None, facecolors = np.arange(len(uvfs))/(len(uvfs)),
@@ -790,7 +853,7 @@ class MyNet(pl.LightningModule):
             ### Compute cut edges based on stitching loss (on original topology and soup topology) ###
             if 'edgeseparation' not in lossdict[0].keys():
                 edge_vpairs = source.edge_vpairs.detach().cpu().numpy()
-                uvpairs = batch_parts["pred_V"].squeeze()[edge_vpairs] # E x 2 x 2 x 2
+                uvpairs = batch_parts["pred_V"].squeeze()[edge_vpairs, :] # E x 2 x 2 x 2
                 uvpairs = uvpairs[keepidxs]
 
                 edgeseparation = torch.sum(torch.nn.functional.l1_loss(uvpairs[:,:,0,:], uvpairs[:,:,1,:], reduction='none'), dim=2)
@@ -815,53 +878,24 @@ class MyNet(pl.LightningModule):
                 soup_cutedges_stitch = np.stack(soup_cutedges_stitch, axis=0) # CutE * 2 x 2 x 2
 
             ### Compute cut edges based on weights (on original topology and soup topology) ###
-            weights = batch_parts['weights']
-            # assert len(weights) == len(edgeseparation), f"weights len: {len(weights)}, edgeseparation len: {len(edgeseparation)}"
+            if "weights" in batch_parts.keys():
+                weights = batch_parts['weights']
+                # assert len(weights) == len(edgeseparation), f"weights len: {len(weights)}, edgeseparation len: {len(edgeseparation)}"
 
-            topo_cutedges_weight = np.where(weights < self.args.weightcuteps)[0]
-            topo_cutedgecolors_weight = np.arange(len(weights))/(len(weights)-1)
+                topo_cutedges_weight = np.where(weights < self.args.weightcuteps)[0]
+                topo_cutedgecolors_weight = np.arange(len(weights))/(len(weights)-1)
 
-            # Convert to soup edges
-            soup_cutedges_weight = []
-            edge_vpairs = source.edge_vpairs.detach().cpu().numpy()
-            for cute in topo_cutedges_weight:
-                vpair = edge_vpairs[cute] # 2 x 2
-                soup_cutedges_weight.append(batch_parts["pred_V"].squeeze()[vpair[:,0]].detach().cpu().numpy())
-                soup_cutedges_weight.append(batch_parts["pred_V"].squeeze()[vpair[:,1]].detach().cpu().numpy())
-            soup_cutedgecolors_weight = np.repeat(topo_cutedges_weight, 2)/(len(weights)-1)
+                # Convert to soup edges
+                soup_cutedges_weight = []
+                edge_vpairs = source.edge_vpairs.detach().cpu().numpy()
+                for cute in topo_cutedges_weight:
+                    vpair = edge_vpairs[cute] # 2 x 2
+                    soup_cutedges_weight.append(batch_parts["pred_V"].squeeze()[vpair[:,0]].detach().cpu().numpy())
+                    soup_cutedges_weight.append(batch_parts["pred_V"].squeeze()[vpair[:,1]].detach().cpu().numpy())
+                soup_cutedgecolors_weight = np.repeat(topo_cutedges_weight, 2)/(len(weights)-1)
 
-            if len(soup_cutedges_weight) > 0:
-                soup_cutedges_weight = np.stack(soup_cutedges_weight, axis=0) # CutE * 2 x 2 x 2
-
-            # edges = None
-            # edgecolors = None
-            # vertexseparation = lossdict[0]['vertexseparation']
-
-            # edgestitchcheck = vertexseparation[source.edgeidxs].detach().cpu().numpy()
-            # cutvidxs = np.where(edgestitchcheck > self.args.cuteps)[0]
-            # cutsoup = [source.valid_edges_to_soup[vi] for vi in cutvidxs]
-
-            # # NOTE: There will be duplicates in cutsoup b/c every edge has two valid edge pairs
-            # # Remove the duplicates here
-            # dedupcutsoup = []
-            # dedupcutvidxs = []
-            # for i in range(len(cutsoup)):
-            #     souppair = cutsoup[i] # 2 x 2
-            #     if souppair not in dedupcutsoup:
-            #         dedupcutsoup.append(souppair)
-            #         dedupcutvidxs.append(cutvidxs[i])
-            # print(f"Original cutsoup #: {len(cutsoup)}. Number of dedup cut edges: {len(dedupcutsoup)}.")
-
-            # Dedup'd edge colors and cut edges
-            # NOTE: This ensures consistent coloring of each edge across different cuts
-            # edgecolors = np.repeat(np.array(source.edgededupidxs)[dedupcutvidxs]/(np.max(source.edgededupidxs) - 1), 2)
-            # edgecolors = np.repeat(dedupcutvidxs, 2)/(len(edgestitchcheck)-1)
-            # edges = []
-            # for souppair in dedupcutsoup:
-            #     edges.append(batch_parts["pred_V"].squeeze()[list(souppair[0])].detach().cpu().numpy())
-            #     edges.append(batch_parts["pred_V"].squeeze()[list(souppair[1])].detach().cpu().numpy())
-            # if len(edges) > 0:
-            #     edges = np.stack(edges, axis=0)
+                if len(soup_cutedges_weight) > 0:
+                    soup_cutedges_weight = np.stack(soup_cutedges_weight, axis=0) # CutE * 2 x 2 x 2
 
             # Compute flips
             from utils import get_flipped_triangles
@@ -869,6 +903,17 @@ class MyNet(pl.LightningModule):
             flipvals = np.zeros(len(batch_parts['T'].squeeze()))
             flipvals[flipped] = 1
             lossdict[0]['fliploss'] = flipvals
+
+            # Compute distortion if not already in loss
+            if 'distortionloss' not in lossdict[0].keys():
+                from source_njf.losses import arap
+                distortionenergy = arap(batch_parts["source_V"], torch.from_numpy(batch_parts["ogT"]).to(self.device),
+                                        batch_parts["pred_V"],
+                                        paramtris = batch_parts["pred_V"].reshape(-1, 3, 2),
+                                        device=self.device,
+                                        renormalize=False,
+                                        return_face_energy=True, timeit=False)
+                lossdict[0]['distortionloss'] = distortionenergy.detach().cpu().numpy()
 
             if len(batch_parts["pred_V"].shape) == 4:
                 for idx in range(len(batch_parts["pred_V"])):
@@ -890,10 +935,12 @@ class MyNet(pl.LightningModule):
             images = [os.path.join(save_path, f"epoch_{self.current_epoch:05}_batch_{batch_idx}.png")] + \
                         [os.path.join(save_path, f"{key}_epoch_{self.current_epoch:05}_batch_{batch_idx}.png") for key in lossdict[0].keys() if "loss" in key]
 
-            if self.args.init in ['tutte', 'slim'] and self.args.ninit == -1:
+            if self.args.init:
                 images = [os.path.join(save_path, f"{self.args.init}_init_epoch_{self.current_epoch:05}_batch_{batch_idx}.png")] + images
-            elif self.current_epoch == 0 and self.args.init:
-                images = [os.path.join(save_path, f"{self.args.init}_init_epoch_{self.current_epoch:05}_batch_{batch_idx}.png")] + images
+
+            # Log GT UVs
+            if self.args.gtuvloss or self.args.gtnetworkloss:
+                images = [os.path.join(source.source_dir, "..", "..", "gtuv.png")] + images
 
             # Filter out all renders that dont exist
             images = [imgpath for imgpath in images if os.path.exists(imgpath)]
@@ -957,30 +1004,33 @@ class MyNet(pl.LightningModule):
                             vmin=0, vmax=1, shading=False)
 
             # Weight cut
-            topo_cutvpairs = source.ogedge_vpairs_nobound[topo_cutedges_weight]
-            cylinderpos = ogvs[topo_cutvpairs]
-            cutlen = torch.sum(source.elens_nobound[topo_cutedges_weight]).item()
+            images = []
+            if "weights" in batch_parts.keys():
+                topo_cutvpairs = source.ogedge_vpairs_nobound[topo_cutedges_weight]
+                cylinderpos = ogvs[topo_cutvpairs]
+                cutlen = torch.sum(source.elens_nobound[topo_cutedges_weight]).item()
 
-            if len(cylinderpos) > 0:
-                export_views(ogvs, batch_parts["ogT"], save_path, filename=f"weightcuts_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
-                            plotname=f"Total weight cut len: {cutlen:0.5f}", cylinders=cylinderpos,
+                if len(cylinderpos) > 0:
+                    export_views(ogvs, batch_parts["ogT"], save_path, filename=f"weightcuts_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
+                                plotname=f"Total weight cut len: {cutlen:0.5f}", cylinders=cylinderpos,
+                                outline_width=0.01, cmap = plt.get_cmap('Reds_r'),
+                                device="cpu", n_sample=30, width=200, height=200,
+                                vmin=0, vmax=1, shading=False)
+
+                # Weights
+                # NOTE: below results in 2x each cylinder but it's fine
+                cylinderpos = ogvs[source.ogedge_vpairs_nobound.detach().cpu().numpy()]
+                cylindervals = np.stack([weights, weights], axis=1) # E x 2
+
+                export_views(ogvs, batch_parts["ogT"], save_path, filename=f"weights_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
+                            plotname=f"Edge Weights", cylinders=cylinderpos,
+                            cylinder_scalars=cylindervals,
                             outline_width=0.01, cmap = plt.get_cmap('Reds_r'),
                             device="cpu", n_sample=30, width=200, height=200,
                             vmin=0, vmax=1, shading=False)
 
-            # Weights
-            # NOTE: below results in 2x each cylinder but it's fine
-            cylinderpos = ogvs[source.ogedge_vpairs_nobound.detach().cpu().numpy()]
-            cylindervals = np.stack([weights, weights], axis=1) # E x 2
+                images = [os.path.join(save_path, f"weights_mesh_{self.current_epoch:05}_batch{batch_idx}.png")]
 
-            export_views(ogvs, batch_parts["ogT"], save_path, filename=f"weights_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
-                        plotname=f"Edge Weights", cylinders=cylinderpos,
-                        cylinder_scalars=cylindervals,
-                        outline_width=0.01, cmap = plt.get_cmap('Reds_r'),
-                        device="cpu", n_sample=30, width=200, height=200,
-                        vmin=0, vmax=1, shading=False)
-
-            images = [os.path.join(save_path, f"weights_mesh_{self.current_epoch:05}_batch{batch_idx}.png")]
             # if os.path.exists(os.path.join(save_path, f"weightcuts_mesh_{self.current_epoch:05}_batch{batch_idx}.png")):
             #     images.append(os.path.join(save_path, f"weightcuts_mesh_{self.current_epoch:05}_batch{batch_idx}.png"))
             if (self.args.init in ["tutte", "slim"] and self.args.ninit == -1) or \
@@ -988,6 +1038,15 @@ class MyNet(pl.LightningModule):
                 boundary_path = os.path.join(save_path, f"boundary_mesh_{self.current_epoch:05}_batch{batch_idx}.png")
                 if os.path.exists(boundary_path):
                     images = [boundary_path] + images
+
+            # Initial cuts
+            if os.path.exists(os.path.join(source.source_dir, "..", "..", "initcuts.png")):
+                images = [os.path.join(source.source_dir, "..", "..", "initcuts.png")] + images
+
+            # GT Cuts
+            if os.path.exists(os.path.join(source.source_dir, "..", "..", "gtcuts.png")):
+                images = [os.path.join(source.source_dir, "..", "..", "gtcuts.png")] + images
+
             self.logger.log_image(key='pred weight', images=images, step=self.current_epoch)
 
             edgecorrespondences = source.edgecorrespondences
@@ -1041,6 +1100,17 @@ class MyNet(pl.LightningModule):
                                     vmin=0, vmax=self.args.edgecut_weight, shading=False,
                                     subcylinders = subcylinders)
 
+                    elif key == "gtweightloss":
+                        from collections import defaultdict
+                        cylinderpos = ogvs[source.ogedge_vpairs_nobound.detach().cpu().numpy()]
+                        cylindervals = np.stack([val, val], axis=1) # E x 2
+
+                        export_views(ogvs, batch_parts["ogT"], save_path, filename=f"{key}_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
+                                    plotname=f"Avg {key}: {np.mean(val):0.4f}", cylinders=cylinderpos,
+                                    cylinder_scalars=cylindervals, outline_width=0.01,
+                                    device="cpu", n_sample=30, width=200, height=200,
+                                    vmin=0, vmax=1, shading=False)
+
                     elif key == "edgegradloss": # E x 2
                         cylindervals = []
                         cylinderpos = []
@@ -1059,11 +1129,18 @@ class MyNet(pl.LightningModule):
                                     cylinder_scalars=cylindervals, outline_width=0.01,
                                     device="cpu", n_sample=30, width=200, height=200,
                                     vmin=0, vmax=0.5, shading=False)
-                    elif key == "distortionloss":
+
+                    elif key in ["distortionloss", "gtjloss", "normalloss"]:
                         export_views(batch_parts["source_V"].detach().cpu().numpy(), batch_parts["ogT"], save_path,
                                      filename=f"{key}_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
                                         plotname=f"Avg {key}: {np.mean(val):0.4f}",
                                         fcolor_vals=val, device="cpu", n_sample=30, width=200, height=200,
+                                        vmin=0, vmax=1, shading=False)
+                    elif key == "gtuvloss":
+                        export_views(batch_parts["source_V"].detach().cpu().numpy(), batch_parts["ogT"], save_path,
+                                     filename=f"{key}_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
+                                        plotname=f"Avg {key}: {np.mean(val):0.4f}",
+                                        vcolor_vals=val, device="cpu", n_sample=30, width=200, height=200,
                                         vmin=0, vmax=1, shading=False)
                     elif key == "invjloss":
                         export_views(batch_parts["source_V"].detach().cpu().numpy(), batch_parts["ogT"], save_path,
@@ -1077,6 +1154,12 @@ class MyNet(pl.LightningModule):
                                         plotname=f"Avg {key}: {np.mean(val):0.4f}",
                                         fcolor_vals=val, device="cpu", n_sample=30, width=200, height=200,
                                         vmin=0, vmax=0.6, shading=False)
+                    elif key == "intersectionloss":
+                        export_views(batch_parts["source_V"].detach().cpu().numpy(), batch_parts["ogT"], save_path,
+                                     filename=f"{key}_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
+                                        plotname=f"Avg {key}: {np.mean(val):0.4f}",
+                                        fcolor_vals=val, device="cpu", n_sample=30, width=200, height=200,
+                                        vmin=0, vmax=1, shading=False)
                     else:
                         continue
 
@@ -1118,6 +1201,10 @@ class MyNet(pl.LightningModule):
             sourcedim = 2
             initj = source.slimj.squeeze().to(self.device)
             initfuv = source.slimfuv.squeeze().to(self.device)
+        elif self.args.init == "precut":
+            sourcedim = 2
+            initj = source.prej.squeeze().to(self.device)
+            initfuv = source.prefuv.squeeze().to(self.device)
 
         # Debugging: fuvs make sense
         # if self.args.debug and self.args.init:
@@ -1137,16 +1224,18 @@ class MyNet(pl.LightningModule):
         vertices = torch.from_numpy(vs).float().to(self.device)
         faces = torch.from_numpy(fs).long().to(self.device)
 
-        if self.args.softpoisson or self.args.optweight:
-            pred_V, pred_J, pred_J_poiss, pred_J_restricted_poiss, weights = self.predict_map(source, target, initj=initj if initj is not None else None)
+        pred_V = pred_J = pred_J_poiss = pred_J_restricted_poiss = weights = None
+        if self.args.directuv:
+            preduv = self.predict_uv(source, target, initfuv = initfuv)
         else:
-            pred_V, pred_J, pred_J_poiss, pred_J_restricted_poiss = self.predict_map(source, target, initj=initj if initj is not None else None)
+            if self.args.softpoisson or self.args.optweight:
+                pred_V, pred_J, pred_J_poiss, pred_J_restricted_poiss, weights = self.predict_map(source, target, initj=initj if initj is not None else None)
+            else:
+                pred_V, pred_J, pred_J_poiss, pred_J_restricted_poiss = self.predict_map(source, target, initj=initj if initj is not None else None)
 
-        # TODO: individual J/weight optimization -- check what happens if we start with ideal Jacobs and optimize just the weights
-
-        # Drop last dimension of restricted J
-        if pred_J_restricted_poiss.shape[2] == 3:
-            pred_J_restricted_poiss = pred_J_restricted_poiss[:,:,:2]
+            # Drop last dimension of restricted J
+            if pred_J_restricted_poiss.shape[2] == 3:
+                pred_J_restricted_poiss = pred_J_restricted_poiss[:,:,:2]
 
         ## Stitching loss schedule
         if self.args.stitchschedule == "linear":
@@ -1182,33 +1271,88 @@ class MyNet(pl.LightningModule):
             sparsecuts_weight = self.args.stitchlossweight_max - 0.5 * (self.args.stitchlossweight_max - self.args.stitchlossweight_min) * (1 + np.cos(np.pi * ratio))
             self.args.sparsecuts_weight = sparsecuts_weight
 
+        normalgrid = None
+        if self.args.normalloss:
+            # NOTE: assumes batch size is always 1
+            normalgrid = self.trainer.optimizers[0].param_groups[1]['params'][batch_idx]
+
         # NOTE predict_map already composites pred_J against initj
-        pred_V = pred_V[:, :, :2].squeeze().reshape(-1, 3, 2)
-        loss = self.lossfcn.computeloss(vertices, faces, ZeroNanGrad.apply(pred_V), ZeroNanGrad.apply(pred_J_poiss[:,:,:2,:]),
-                                        weights=weights, stitchweights=self.stitchweights[batch_idx],
-                                        source=source, keepidxs=source.keepidxs)
+        if self.args.directuv:
+            loss = self.lossfcn.computeloss(vertices, faces, preduv.reshape(-1, 3, 2),
+                                            weights=weights, stitchweights=self.stitchweights[batch_idx],
+                                            source=source, keepidxs=source.keepidxs, mesh = mesh,
+                                            normalgrid=normalgrid)
+        else:
+            pred_V = pred_V[:, :, :2].squeeze().reshape(-1, 3, 2)
+            loss = self.lossfcn.computeloss(vertices, faces, ZeroNanGrad.apply(pred_V), ZeroNanGrad.apply(pred_J_poiss[:,:,:2,:]),
+                                            weights=weights, stitchweights=self.stitchweights[batch_idx],
+                                            source=source, keepidxs=source.keepidxs, mesh = mesh, predj = pred_J,
+                                            normalgrid=normalgrid)
 
         lossrecord = self.lossfcn.exportloss()
         self.lossfcn.clear() # This resets the loss record dictionary
 
         ### ==== SDS Losses ==== ###
-        # if self.args.sdsloss:
-        #     # Prereqs: texture image, texture description
-        #     assert self.args.textureimg is not None and self.args.texturetext is not None, "Need to specify textureimg and texturetext for SDS loss"
+        if self.args.sdsloss:
+            # Set cache directories
+            # import os
+            # os.environ['HF_DATASETS_CACHE'] = "/net/scratch/rliu/.cache"
+            # os.environ['HF_HOME'] = "/net/scratch/rliu/.cache"
 
-        #     from diffusion_guidance.deepfloyd_if import DeepFloydIF
-        #     diffusion = DeepFloydIF() # optionally you can pass a config at initialization
+            # Prereqs: texture image, texture description
+            assert self.args.textureimg is not None and self.args.texturetext is not None, "Need to specify textureimg and texturetext for SDS loss"
+            from diffusion_guidance.deepfloyd_if import DeepFloydIF, DeepFloydIF_Img2Img
 
-        #     # Text encoding
-        #     text_z, text_z_neg = diffusion.encode_prompt(self.args.texturetext)
+            if self.args.sdsloss == "text2img":
+                diffusion = DeepFloydIF() # optionally you can pass a config at initialization
+            elif self.args.sdsloss == "img2img":
+                diffusion = DeepFloydIF_Img2Img()
 
-        #     # TODO: Render texture image on mesh for randomly sampled views
-        #     from PIL import Image
-        #     from torchvision.transforms.functional import pil_to_tensor
-        #     textureimg = pil_to_tensor(Image.open(self.args.textureimg))
+            # Text encoding
+            texturetext = ' '.join(self.args.texturetext)
+            text_z, text_z_neg = diffusion.encode_prompt(texturetext)
 
-        #     sds = self.diffusion(rgb_images, text_z_inputs, text_z_neg_inputs)
-        #     sdsloss = sds['loss_sds']
+            # TODO: Render texture image on mesh for randomly sampled views
+            from PIL import Image
+            from torchvision.transforms.functional import pil_to_tensor
+            textureimg = pil_to_tensor(Image.open(self.args.textureimg)).double().to(self.device)
+
+            rgb_images = []
+            # NOTE: Can upscale resolution to get better gradients
+            from renderer import render_texture
+
+            num_views = 5
+            radius = 2.5
+            center = torch.zeros(2)
+            azim = torch.linspace(center[0], 2 * np.pi + center[0], num_views + 1)[
+               :-1].double().to(self.device)
+            elev = torch.zeros(len(azim), device=self.device).double()
+
+            # Face UVs
+            uv_face = pred_V # F x 3 x 2
+
+            # Need to scale UVs between 0-1
+            uv_face = uv_face - torch.min(uv_face.reshape(-1, 2), dim=0)[0]
+            uv_face = uv_face/torch.max(uv_face)
+
+            ## DEBUGGING
+            # if self.args.debug:
+            #     uv_face = torch.load("/net/scratch/rliu/NJFWand/data/cone/gt_uvs.pt").reshape(-1, 3, 2).to(self.device)
+
+            #     # Need to scale UVs between 0-1
+            #     uv_face -= torch.min(uv_face.reshape(-1, 2), dim=0)[0]
+            #     uv_face /= torch.max(uv_face)
+
+            rgb_images.append(render_texture(vertices.double(), faces, uv_face, elev, azim, radius, textureimg/255, lights=None,
+                                                  resolution=(128, 128), device=self.device, lookatheight=0, whitebg=True,
+                                                  interpolation_mode='bilinear'))
+
+            sds = diffusion(rgb_images[0]['image'], text_z)
+            sdsloss = sds['loss_sds']
+
+            loss = loss + sdsloss
+            lossrecord[0]['sdsloss'] = sdsloss.cpu().detach().numpy()
+            lossrecord[0]['target'] = sds['target'].cpu().detach().numpy()
 
         # If running stitchweights, then update here
         # NOTE: stitchweights is len(valid_pairs) but weights is len(valid_edges)
@@ -1233,233 +1377,67 @@ class MyNet(pl.LightningModule):
         if self.verbose:
             print(
                 f"batch of {target.get_vertices().shape[0]:d} source <--> target pairs, each mesh {target.get_vertices().shape[1]:d} vertices, {source.get_source_triangles().shape[1]:d} faces")
-        ret = {
-            "target_V": vertices.detach(),
-            "source_V": vertices.detach(),
-            "pred_V": pred_V.detach(),
-            "pred_J": pred_J.detach(),
-            "T": faces.detach().cpu().numpy(),
-            'source_ind': source.source_ind,
-            'target_inds': target.target_inds,
-            "lossdict": lossrecord,
-            "loss": loss,
-        }
 
-        if self.args.softpoisson or self.args.optweight:
-            ret['weights'] = weights.detach().cpu().numpy()
+        if self.args.directuv:
+            ret = {
+                "target_V": vertices.detach(),
+                "source_V": vertices.detach(),
+                "pred_V": preduv.detach(),
+                'T': np.arange(len(faces) * 3).reshape(len(faces), 3),
+                "ogT": faces.detach().cpu().numpy(),
+                'source_ind': source.source_ind,
+                'target_inds': target.target_inds,
+                "lossdict": lossrecord,
+                "loss": loss,
+            }
 
-        # Need to adjust the return values if no poisson solve
-        if self.args.no_poisson and len(pred_V) == len(faces):
-            ret['pred_V'] = pred_V.detach().reshape(-1, 2)
+            if self.args.sdsloss:
+                ret['textureimgs'] = rgb_images[0]['image'].detach().cpu().numpy()
 
-            # Triangle soup
-            ret['ogT'] = ret['T'] # Save original triangle indices
-            ret['T'] = np.arange(len(faces)*3).reshape(len(faces), 3)
+            return ret
 
-            # Debugging: predicted fuvs make sense
-            if self.args.debug:
-                import matplotlib.pyplot as plt
-                fig, axs = plt.subplots(figsize=(6, 4))
-                axs.triplot(ret['pred_V'][:,0].detach().cpu().numpy(), ret['pred_V'][:,1].detach().cpu().numpy(), ret['T'], linewidth=0.5)
-                plt.axis('off')
-                plt.savefig(f"scratch/{source.source_ind}_fuv_pred.png")
-                plt.close(fig)
-                plt.cla()
+        else:
+            ret = {
+                "target_V": vertices.detach(),
+                "source_V": vertices.detach(),
+                "pred_V": pred_V.detach(),
+                "pred_J": pred_J.detach(),
+                "T": faces.detach().cpu().numpy(),
+                'source_ind': source.source_ind,
+                'target_inds': target.target_inds,
+                "lossdict": lossrecord,
+                "loss": loss,
+            }
 
-        # if self.args.test:
-        #     ret['pred_J_R'] = poisson_J_restricted.detach()
-        #     ret['target_J_R'] = GT_J_restricted.detach()
+            if self.args.sdsloss:
+                ret['textureimgs'] = rgb_images[0]['image'].detach().cpu().numpy()
+
+            if self.args.softpoisson or self.args.optweight:
+                ret['weights'] = weights.detach().cpu().numpy()
+
+            # Need to adjust the return values if no poisson solve
+            if self.args.no_poisson and len(pred_V) == len(faces):
+                ret['pred_V'] = pred_V.detach().reshape(-1, 2)
+
+                # Triangle soup
+                ret['ogT'] = ret['T'] # Save original triangle indices
+                ret['T'] = np.arange(len(faces)*3).reshape(len(faces), 3)
+
+                # Debugging: predicted fuvs make sense
+                if self.args.debug:
+                    import matplotlib.pyplot as plt
+                    fig, axs = plt.subplots(figsize=(6, 4))
+                    axs.triplot(ret['pred_V'][:,0].detach().cpu().numpy(), ret['pred_V'][:,1].detach().cpu().numpy(), ret['T'], linewidth=0.5)
+                    plt.axis('off')
+                    plt.savefig(f"scratch/{source.source_ind}_fuv_pred.png")
+                    plt.close(fig)
+                    plt.cla()
+
+            # if self.args.test:
+            #     ret['pred_J_R'] = poisson_J_restricted.detach()
+            #     ret['target_J_R'] = GT_J_restricted.detach()
 
         return ret
-
-    def test_step_end(self, batch_parts):
-        def screenshot(fname, V, F):
-            fig = matplotlib.pyplot.figure()
-            ax = matplotlib.pyplot.axes(projection='3d')
-            ax.plot_trisurf(V[:, 0], V[:, 1], V[:, 2], triangles=F, edgecolor=[[0, 0, 0]], linewidth=0.01, alpha=1.0)
-            matplotlib.pyplot.savefig(fname)
-            matplotlib.pyplot.close(fig)
-
-        # this next few lines make sure cupy releases all memory
-        if USE_CUPY:
-            mempool = cupy.get_default_memory_pool()
-            pinned_mempool = cupy.get_default_pinned_memory_pool()
-            mempool.free_all_blocks()
-            pinned_mempool.free_all_blocks()
-        loss = batch_parts["loss"].mean()
-        if math.isnan(loss):
-            print("loss is nan during validation!")
-        tb = self.logger.experiment
-
-        # tb.add_scalar("test vertex loss", batch_parts["vertex_loss"].mean().cpu().numpy(), global_step=self.global_step)
-        # tb.add_scalar("test jacobian loss", batch_parts["jacobian_loss"].mean().cpu().numpy(),
-        #               global_step=self.global_step)
-        # colors = self.colors(batch_parts["source_V"][0].cpu().numpy(), batch_parts["T"][0])
-        #
-        # self.log('test_loss', loss.item(), logger=True, prog_bar=True, on_step=False, on_epoch=True)
-
-        # TODO: fix below
-        # if self.args.xp_type == "uv":
-        #     if self.val_step_iter % 100 == 0:
-        #         print("saving validation intermediary results.")
-        #         for idx in range(len(batch_parts["pred_V"])):
-        #             path = Path(self.logger.log_dir) / f"valid_batchidx_{idx:05}.png"
-        #             plot_uv(path, batch_parts["target_V"][idx].squeeze().cpu().numpy(), batch_parts["T"][idx].squeeze())
-
-        # self.log('test_loss', loss.item(), logger=True, prog_bar=True, on_step=False, on_epoch=True)
-        MAX_SOURCES_TO_SAVE = 11000000
-        MAX_TARGETS_TO_SAVE = 10000000
-
-        WRITE_TB = True
-        QUALITATIVE = (not self.args.statsonly) and (not self.args.only_final_stats)
-        QUANTITATIVE = True
-        ONLY_FINAL = self.args.only_final_stats
-        sdir = 'None'
-        tpath = 'None'
-        if QUALITATIVE:
-            colors = self.colors(batch_parts["source_V"][0].cpu().numpy(), batch_parts["T"][0])
-        if QUANTITATIVE:
-            pred_time = batch_parts["pred_time"]
-            self.__test_stats.add_pred_time(pred_time)
-        for source_batch_ind in range(len(batch_parts["pred_V"])):
-            if source_batch_ind > MAX_SOURCES_TO_SAVE:
-                break
-            source_mesh_ind = batch_parts['source_ind'][source_batch_ind]
-            if not ONLY_FINAL:
-                sdir = os.path.join(self.logger.log_dir, f"S{source_mesh_ind:06d}")
-                print(f'writing source {source_mesh_ind}')
-                if not os.path.exists(sdir):
-                    try:
-                        os.mkdir(sdir)
-                    except Exception as e:
-                        print(f"had exception {e}, continuing to next source")
-                        continue
-                sfile = os.path.join(sdir, f'{source_mesh_ind:06d}')
-            source_T = batch_parts["T"][source_batch_ind].squeeze()
-            source_V = batch_parts["source_V"][source_batch_ind].squeeze().cpu().detach()
-            source_V_n = source_V.cpu().numpy()
-            if QUANTITATIVE:
-                source_areas = igl.doublearea(source_V_n, source_T)
-                source_area = sum(source_areas)
-            if QUALITATIVE:
-                igl.write_obj(sfile + ".obj", source_V_n, source_T)
-                screenshot(os.path.join(self.logger.log_dir, f"S{source_mesh_ind:06d}") + '.png', source_V_n, source_T)
-            if QUANTITATIVE:
-                self.__test_stats.add_area(source_area)
-            if WRITE_TB:
-                colors = self.colors(numpy.array(source_V), numpy.array(source_T).astype(int))
-                tb.add_mesh("test_source", vertices=source_V.unsqueeze(0).cpu().numpy(),
-                            faces=numpy.expand_dims(source_T, 0),
-                            global_step=self.global_step, colors=colors)
-
-            for target_batch_ind in range(batch_parts["pred_V"][source_batch_ind].shape[0]):
-                if target_batch_ind > MAX_TARGETS_TO_SAVE:
-                    break
-                target_mesh_ind = batch_parts['target_inds'][source_batch_ind][target_batch_ind]
-                if not ONLY_FINAL:
-                    tdir = os.path.join(sdir, f'{target_mesh_ind:06d}')
-                    try:
-                        os.mkdir(tdir)
-                    except Exception as e:
-                        print(f"had exception {e}, continuing to next source")
-                        continue
-
-                tpath = os.path.join(self.logger.log_dir, f'{target_mesh_ind:06d}_from_{source_mesh_ind:06d}')
-                pred_V = batch_parts["pred_V"][source_batch_ind][target_batch_ind].squeeze().cpu().detach()
-                target_V = batch_parts["target_V"][source_batch_ind][target_batch_ind].squeeze().cpu().detach()
-                pred_J = batch_parts["pred_J_R"][source_batch_ind][target_batch_ind].squeeze().cpu().detach()
-                target_J = batch_parts["target_J_R"][source_batch_ind][target_batch_ind].squeeze().cpu().detach()
-                assert len(pred_J.shape) == 3
-                assert len(target_J.shape) == 3
-                target_V_n = target_V.numpy()
-                pred_V_n = pred_V.numpy()
-
-                if QUANTITATIVE:
-                    target_N = igl.per_vertex_normals(target_V_n, source_T)
-                    pred_N = igl.per_vertex_normals(pred_V_n, source_T)
-                    dot_N = np.sum(pred_N * target_N, 1)
-                    dot_N = np.clip(dot_N, 0, 1)  # adding this to avoid Nans
-                    angle_N = np.arccos(dot_N)
-                    angle_sum = np.sum(angle_N)
-                    array_has_nan = np.isnan(angle_sum)
-                    if array_has_nan:
-                        print("loss is nan during angle validation!")
-
-                    self.__test_stats.add_angle_N(np.mean(angle_N))
-                    self.__test_stats.add_V(pred_V, target_V)
-                    self.__test_stats.add_J(pred_J, target_J)
-
-                if QUALITATIVE:
-
-                    igl.write_obj(tpath + '_target.obj', target_V_n, source_T)
-                    igl.write_obj(tpath + '_pred.obj', pred_V_n, source_T)
-                    if self.args.xp_type == "uv":
-                        save_mesh_with_uv.write_with_uv(tpath + '_source_textured_by_uv_target.obj', source_V_n,
-                                                        source_T, np.delete(target_V.numpy(), 2, axis=1))
-                        save_mesh_with_uv.write_with_uv(tpath + '_source_textured_by_uv_pred.obj', source_V_n, source_T,
-                                                        np.delete(pred_V.numpy(), 2, axis=1))
-                    else:
-                        screenshot(tpath + '_pred.png', pred_V_n, source_T)
-                        screenshot(tpath + '_target.png', target_V_n, source_T)
-                if WRITE_TB and target_batch_ind == 0:
-                    tb.add_mesh("test_target_gt", vertices=target_V.unsqueeze(0).numpy(),
-                                faces=numpy.expand_dims(source_T, 0),
-                                global_step=self.global_step, colors=colors)
-                    tb.add_mesh("test_target_pred", vertices=pred_V.unsqueeze(0).numpy(),
-                                faces=numpy.expand_dims(source_T, 0),
-                                global_step=self.global_step, colors=colors)
-
-                if self.args.xp_type == "uv":
-
-                    if QUALITATIVE:
-                        plot_uv(tpath + "_uv", target_V,
-                                pred_V, source_T)
-
-                    def save_slim_stats(fname, mat, source_areas, source_area):
-                        mat = mat.double()
-                        source_areas = source_areas.astype('float64')
-                        source_area = source_area.astype('float64')
-                        mat = np.delete(mat, 2, axis=1)
-                        s = numpy.linalg.svd(mat, compute_uv=False)
-                        assert len(s.shape) == 2
-                        assert s.shape[0] == pred_J.shape[0]
-                        s = np.sort(s, axis=1)
-
-                        dist_metric = s.copy()
-                        dist_metric[:, 0] = 1 / (dist_metric[:, 0] + 1e-8)
-                        dist_metric = np.max(dist_metric, axis=1)
-                        dist_metric = np.sum(dist_metric > 10)
-
-                        s[s < 1e-8] = 1e-8
-                        slim = s ** 2 + numpy.reciprocal(s) ** 2
-                        det = np.linalg.det(mat)
-                        assert len(det.shape) == 1 and det.shape[0] == pred_J.shape[0]
-                        flips = np.sum(det <= 0)
-                        avg_slim = np.sum(np.expand_dims(source_areas, 1) * slim) / (source_area)
-                        if not ONLY_FINAL:
-                            np.savez(f'{fname}.npz', det=det, flips=flips, avg_slim=avg_slim, slim=slim,
-                                     singular_values=s, tri_area=source_area, dist_metric=dist_metric)
-                        return avg_slim, flips, dist_metric
-
-                    if QUANTITATIVE:
-                        avg_slim_gt, flips_gt, dist_metric_gt = save_slim_stats(tpath + '_gt_slim_stats', target_J,
-                                                                                source_areas, source_area)
-                        avg_slim_pred, flips_pred, dist_metric_pred = save_slim_stats(tpath + '_pred_slim_stats',
-                                                                                      pred_J, source_areas, source_area)
-                        self.__test_stats.add_slim(avg_slim_pred)
-                        self.__test_stats.add_flips(flips_pred)
-                        self.__test_stats.add_dist_metric(dist_metric_pred)
-                        self.__test_stats.add_slim_gt(avg_slim_gt)
-                        self.__test_stats.add_flips_gt(flips_gt)
-                        self.__test_stats.add_dist_metric_gt(dist_metric_gt)
-                        with open(tpath + '_slim_summary.txt', 'w') as f:
-                            f.write(f'{"":10}|  {"avg slim":20} | flips | d<10 \n')
-                            f.write(f'----------------------------------------------\n')
-                            f.write(f'{"GT   ":10}| {avg_slim_gt:20} | {flips_gt} | {dist_metric_gt} \n')
-                            f.write(f'{"Ours ":10}| {avg_slim_pred:20} | {flips_pred} | {dist_metric_pred} \n')
-
-        self.__test_stats.dump(os.path.join(self.logger.log_dir, 'teststats'))
-        return loss
 
     def colors(self, v, f):
         vv = igl.per_vertex_normals(v, f)
@@ -1514,22 +1492,19 @@ class MyNet(pl.LightningModule):
                 source, target = bundle
                 initweights = source.initweights
                 optweights = torch.zeros(initweights.shape).to(self.device).double() + 1e-7
-                optweights.requires_grad_()
+                optweights.requires_glrad_()
                 additional_parameters = [optweights]
                 optimizer.add_param_group({"params": additional_parameters, 'lr': self.lr})
 
-        # Add translation as additional parameter
-        # NOTE: With gradient stitching, we use L0 weighted least squares instead
-        if self.args.no_poisson and self.args.lossedgeseparation:
+        # Add texture optimization as additional parameter (from NUVO)
+        # Resolution: 256 x 256
+        if self.args.normalloss:
             self.trainer.fit_loop.setup_data()
             dataloader = self.trainer.train_dataloader
             for i, bundle in enumerate(dataloader):
                 source, target = bundle
-                faces = source.get_source_triangles()
-                init_translate = torch.ones(faces.shape[0], 1, 2).to(self.device).float() * 0.5
-                init_translate.requires_grad_()
-                additional_parameters = [init_translate]
-                optimizer.add_param_group({"params": additional_parameters, 'lr': self.lr}) # Direct optimization needs to be 100x larger
+                normalgrid = torch.zeros((3, 256, 256), dtype=torch.double, device=self.device, requires_grad=True)
+                optimizer.add_param_group({"params": [normalgrid], 'lr': self.lr})
 
         return {"optimizer": optimizer,
                 # "lr_scheduler": {
@@ -1579,7 +1554,7 @@ def main(gen, args):
 
     # Save directory
     save_path = os.path.join(args.outputdir, args.expname)
-    if args.overwrite and os.path.exists(save_path):
+    if args.overwrite and os.path.exists(save_path) and not args.continuetrain and not args.test:
         from utils import clear_directory
         clear_directory(save_path)
     Path(save_path).mkdir(exist_ok=True, parents=True)
@@ -1619,15 +1594,9 @@ def main(gen, args):
 
     else:
         ### DEFAULT GOES HERE ###
-        if not args.compute_human_data_on_the_fly:
-            with open(os.path.join(args.root_dir_test, args.data_file)) as file:
-                data = json.load(file)
-                pairs_test = data['pairs']
-        else:
-            if args.experiment_type == "REGISTER_TEMPLATE":
-                pairs_test = [(f"ren_template", f"{(2*i):08d}") for i in range(args.size_test)]
-            elif  args.experiment_type == "TPOSE":
-                pairs_test = [(f"{(2*i):08d}", f"{(2*i+1):08d}") for i in range(args.size_test)]
+        with open(os.path.join(args.root_dir_test, args.test_file)) as file:
+            data = json.load(file)
+            pairs_test = data['pairs']
 
         print("TEST :", len(pairs_test))
         valid_pairs = pairs_test
@@ -1668,7 +1637,7 @@ def main(gen, args):
                          logger=logger,
                          plugins=[SLURMEnvironment(requeue_signal=SIGUSR1)] if not args.debug else None,
                          accumulate_grad_batches=args.accumulate_grad_batches,
-                         num_sanity_val_steps=1,
+                         num_sanity_val_steps=-1,
                          enable_model_summary=False,
                          enable_progress_bar=True,
                          num_nodes=1,
@@ -1719,14 +1688,8 @@ def main(gen, args):
     if args.no_validation or args.test:
         valid_loader = None
     else:
-        # NOTE: In the single cut neuralopt case -- we just copy over the training data
-        if args.ninit == 1:
-            valid_dataset = train_dataset
-        else:
-            valid_dataset = DeformationDataset(valid_pairs, gen.get_keys_to_load(True),
-                                            gen.get_keys_to_load(False), use_dtype, train=False, args=args)
-        # if args.softpoisson:
-        #     valid_dataset.get_weights_dim()
+        valid_dataset = DeformationDataset(valid_pairs, gen.get_keys_to_load(True),
+                                        gen.get_keys_to_load(False), use_dtype, train=False, args=args)
 
         valid_loader = DataLoader(valid_dataset, batch_size=1, collate_fn=custom_collate, pin_memory=(args.unpin_memory is None),
                                   shuffle=False, num_workers=0, persistent_workers=0)
@@ -1797,8 +1760,8 @@ def main(gen, args):
         ret = model.my_step(devdata, idx, validation=True)
         source, target = data
         sourcepath = source.source_dir
-        np.save(os.path.join(sourcepath, f"latest_preduv.npy"), ret['pred_V'].squeeze().detach().cpu().numpy())
-        np.save(os.path.join(sourcepath, f"latest_predt.npy"), ret['T'])
+        np.save(os.path.join(sourcepath, f"latest_preduv_{idx}.npy"), ret['pred_V'].squeeze().detach().cpu().numpy())
+        np.save(os.path.join(sourcepath, f"latest_predt_{idx}.npy"), ret['T'])
 
         # if args.no_poisson:
         #     np.save(os.path.join(sourcepath, f"latest_poissonuv.npy"), ret['poissonUV'].squeeze().detach().cpu().numpy())
