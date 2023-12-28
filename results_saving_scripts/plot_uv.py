@@ -284,6 +284,24 @@ def plot_uv(path, name, pred_vertices, triangles, gt_vertices=None, losses=None,
                     axs.axis("equal")
                     plt.savefig(os.path.join(path, f"{key}_{fname}.png"), bbox_inches='tight', dpi=600)
                     plt.close()
+                elif key == "normalloss":
+                    fig, axs = plt.subplots(figsize=(5,5))
+                    fig.suptitle(f"Average Normal Loss: {np.mean(val):0.8f}")
+                    cmap = plt.get_cmap("Reds")
+
+                    axs.tripcolor(tris, val, cmap=cmap,
+                                linewidth=0.1, vmin=0, vmax=1, edgecolor='black')
+
+                    # Plot edges if given
+                    if edges is not None and len(edges) > 0:
+                        for i, e in enumerate(edges):
+                            axs.plot(e[:, 0], e[:, 1], marker='none', linestyle='-',
+                                        color=edge_cmap(edgecolors[i]) if edgecolors is not None else "black", linewidth=1.5)
+
+                    plt.axis('off')
+                    axs.axis("equal")
+                    plt.savefig(os.path.join(path, f"{key}_{fname}.png"), bbox_inches='tight', dpi=600)
+                    plt.close()
                 elif key == "gtjloss":
                     fig, axs = plt.subplots(figsize=(5,5))
                     fig.suptitle(f"Average GT Jacobian Loss: {np.mean(val):0.8f}")
@@ -350,7 +368,7 @@ def plot_uv(path, name, pred_vertices, triangles, gt_vertices=None, losses=None,
                     continue
 
 
-def export_views(vertices, faces, savedir, n=5, n_sample=20, width=150, height=150, plotname="Views", filename="test", fcolor_vals=None,
+def export_views(vertices, faces, savedir, n=5, n_sample=20, width=150, height=150, plotname="Views", filename="test.png", fcolor_vals=None,
                  vcolor_vals=None, shading=True, cylinders=None, cylinder_scalars=None, subcylinders=None,
                  device="cpu", outline_width=0.005, cmap= plt.get_cmap("Reds"), vmin=0, vmax=1):
     import torch

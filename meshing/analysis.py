@@ -81,9 +81,13 @@ def computeFaceNormals(mesh):
             continue
         u = mesh.vector(f.halfedge)
         v = -1 * mesh.vector(f.halfedge.prev())
-        edges1.append(u)
-        edges2.append(v)
+        edges1.append(u/np.linalg.norm(u))
+        edges2.append(v/np.linalg.norm(v))
     n = np.cross(edges1, edges2, axis=1)
+
+    if len(n.shape) > 1:
+        n /= np.linalg.norm(n, axis=1, keepdims=True)
+
     mesh.fnormals = n
 
 # Mean of adjacent face normals

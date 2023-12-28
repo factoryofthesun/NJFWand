@@ -38,6 +38,7 @@ def get_arg_parser():
 	### ARCH
 	parser.add_argument('--arch', type=str, choices={'diffusionnet', 'meshcnn', 'mlp'}, help="architecture to use", default='mlp')
 	parser.add_argument('--softpoisson', type=str, choices={'edges', 'valid'}, help="SOFT POISSON", default=None)
+	parser.add_argument('--directuv', action="store_true", help='directly predict UVs instead of through poisson')
 	parser.add_argument('--sparsepoisson', action="store_true")
 	parser.add_argument("--spweight", choices={"nonzero", 'sigmoid', 'seamless', 'cosine', 'softmax'}, type=str,
 						help = "how to map dot product to soft poisson weights", default='sigmoid')
@@ -146,6 +147,8 @@ def get_arg_parser():
 	parser.add_argument("--gtuvloss", help="use ground truth uv supervision", action="store_true")
 	parser.add_argument("--gtnetworkloss", help="use ground truth j and weights", action="store_true")
 	parser.add_argument("--gtjloss", help="ground truth jacobian loss", action="store_true")
+	parser.add_argument("--normalloss", help="normal grid loss", action="store_true")
+	parser.add_argument("--normalloss_weight", help="weight for normalloss", default=0.1, type=float)
 	parser.add_argument("--removecutfromloss", action="store_true")
 
 	# Seamless

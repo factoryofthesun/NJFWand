@@ -15,8 +15,10 @@ def clear_directory(path):
             print('Failed to delete %s. Reason: %s' % (file_path, e))
 
 def normalize_uv(uv):
-    uv -= torch.min(uv.reshape(-1, 2), dim=0)[0].detach()
-    uv /= torch.max(torch.linalg.norm(uv.reshape(-1, 2), dim=1)).detach()
+    # Center at origin
+    uv -= torch.mean(uv.reshape(-1, 2), dim=0).detach()
+    # Scale to 0.5 circle
+    uv /= 2 * torch.max(torch.linalg.norm(uv.reshape(-1, 2), dim=1)).detach()
 
 def fix_orientation(vertices, faces):
     from igl import bfs_orient

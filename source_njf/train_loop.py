@@ -68,7 +68,38 @@ class MyNet(pl.LightningModule):
 
         # NOTE: code dim refers to the pointnet encoding. Point_dim is centroid position (also potentially fourier features)
         layer_normalization = self.get_layer_normalization_type()
-        if self.args.softpoisson:
+
+        if self.args.directuv:
+            # Arch for direct UV prediction (NO SP): two diffusionnets => vertex + face encoder => MLP decoder for UVs
+            # TODO: Condition on initial UVs => positional encoding on init UVs MAYBE
+            input_dim = point_dim + code_dim
+
+            from diffusionnet import DiffusionNet
+            self.vertexencoder = DiffusionNet(C_in=input_dim, C_out=self.args.vertexdim, C_width=128, N_block=4, outputs_at='vertices',
+                                            with_gradient_features=True, with_gradient_rotations=True)
+            self.faceencoder = DiffusionNet(C_in=input_dim, C_out=self.args.facedim, C_width=128, N_block=4, outputs_at='faces',
+                                            with_gradient_features=True, with_gradient_rotations=True)
+
+            encoderdim = self.args.vertexdim + self.args.facedim
+
+            if self.args.init:
+                encoderdim += 2
+
+            self.uvdecoder = nn.Sequential(nn.Linear(encoderdim, 128),
+                                        nn.ReLU(),
+                                        nn.Linear(128, 256),
+                                        nn.ReLU(),
+                                        nn.Linear(256, 128),
+                                        nn.ReLU(),
+                                        nn.Linear(128, 2),
+                                        )
+
+            # TODO: Does this fk our gradients??
+            # Initialize uv decoder weights to 0
+            # self.uvdecoder[-1].bias.data.zero_()
+            # self.uvdecoder[-1].weight.data.zero_()
+
+        elif self.args.softpoisson:
             assert face_dim > 0, f"face_dim must be > 0 for soft poisson. face_dim: {face_dim}."
 
             # TODO: INPUT DIM IS DIFFERENT FOR DIFFUSIONNET (NEED VERTEX FEATURES)
@@ -81,7 +112,7 @@ class MyNet(pl.LightningModule):
                 from diffusionnet import DiffusionNet
                 vertexdim = self.args.vertexdim
                 self.vertexencoder = DiffusionNet(C_in=input_dim, C_out=self.args.vertexdim, C_width=128, N_block=4, outputs_at='vertices',
-                                                  with_gradient_features=True, with_gradient_rotations=True)
+                                                with_gradient_features=True, with_gradient_rotations=True)
                 face_decoder_dim = 9
                 edge_decoder_dim = 1
                 self.edge_decoder = nn.Sequential(nn.Linear(self.args.vertexdim, 128),
@@ -113,7 +144,6 @@ class MyNet(pl.LightningModule):
                 if self.__IDENTITY_INIT:
                     self.face_decoder[-1].bias.data.zero_()
                     self.face_decoder[-1].weight.data.zero_()
-
             ## TODO
             elif self.arch == "attention":
                 pass
@@ -166,51 +196,6 @@ class MyNet(pl.LightningModule):
                                                     nn.ReLU(),
                                                     nn.Linear(channels, channels),
                                                     )
-        elif layer_normalization == "IDENTITY":
-            # print("Using IDENTITY (no normalization) in face_decoder!")
-            self.face_decoder = nn.Sequential(nn.Linear(point_dim + code_dim, 128),
-                                                  nn.Identity(),
-                                                  nn.ReLU(),
-                                                  nn.Linear(128, 128),
-                                                  nn.Identity(),
-                                                  nn.ReLU(),
-                                                  nn.Linear(128, 128),
-                                                  nn.Identity(),
-                                                  nn.ReLU(),
-                                                  nn.Linear(128, 128),
-                                                  nn.Identity(),
-                                                  nn.ReLU(),
-                                                  nn.Linear(128, 9))
-        elif layer_normalization == "BATCHNORM":
-            # print("Using BATCHNORM in face_decoder!")
-            self.face_decoder = nn.Sequential(nn.Linear(point_dim + code_dim, 128),
-                                                  nn.BatchNorm1d(128),
-                                                  nn.ReLU(),
-                                                  nn.Linear(128, 128),
-                                                  nn.BatchNorm1d(128),
-                                                  nn.ReLU(),
-                                                  nn.Linear(128, 128),
-                                                  nn.BatchNorm1d(128),
-                                                  nn.ReLU(),
-                                                  nn.Linear(128, 128),
-                                                  nn.BatchNorm1d(128),
-                                                  nn.ReLU(),
-                                                  nn.Linear(128, 9))
-        elif layer_normalization == "GROUPNORM_CONV":
-            # print("Using GROUPNORM2 in face_decoder!")
-            self.face_decoder = nn.Sequential(nn.Conv1d(point_dim + code_dim, 128, 1),
-                                                  nn.GroupNorm(num_groups=4, num_channels=128),
-                                                  nn.ReLU(),
-                                                  nn.Conv1d(128, 128, 1),
-                                                  nn.GroupNorm(num_groups=4, num_channels=128),
-                                                  nn.ReLU(),
-                                                  nn.Conv1d(128, 128, 1),
-                                                  nn.GroupNorm(num_groups=4, num_channels=128),
-                                                  nn.ReLU(),
-                                                  nn.Conv1d(128, 128, 1),
-                                                  nn.GroupNorm(num_groups=4, num_channels=128),
-                                                  nn.ReLU(),
-                                                  nn.Conv1d(128, 9, 1))
         elif layer_normalization == "GROUPNORM":
             # print("Using GROUPNORM in face_decoder!")
             self.face_decoder = nn.Sequential(nn.Linear(point_dim + code_dim, 128),
@@ -282,10 +267,19 @@ class MyNet(pl.LightningModule):
         if self.arch == 'mlp':
             return self.face_decoder(x)
         elif self.arch == 'diffusionnet':
-            return self.vertexencoder(x, source.get_loaded_data('mass'), L=source.get_loaded_data('L'),
+            if self.args.directuv:
+                return self.vertexencoder(x, source.get_loaded_data('mass'), L=source.get_loaded_data('L'),
+                                      evals=source.get_loaded_data('evals'), evecs=source.get_loaded_data('evecs'),
+                                      gradX=source.get_loaded_data('gradX'), gradY=source.get_loaded_data('gradY'),
+                                      faces=source.get_loaded_data('faces')), self.faceencoder(x, source.get_loaded_data('mass'), L=source.get_loaded_data('L'),
                                       evals=source.get_loaded_data('evals'), evecs=source.get_loaded_data('evecs'),
                                       gradX=source.get_loaded_data('gradX'), gradY=source.get_loaded_data('gradY'),
                                       faces=source.get_loaded_data('faces'))
+            else:
+                return self.vertexencoder(x, source.get_loaded_data('mass'), L=source.get_loaded_data('L'),
+                                        evals=source.get_loaded_data('evals'), evecs=source.get_loaded_data('evecs'),
+                                        gradX=source.get_loaded_data('gradX'), gradY=source.get_loaded_data('gradY'),
+                                        faces=source.get_loaded_data('faces'))
 
     def predict_jacobians(self, source, target):
         '''
@@ -612,6 +606,9 @@ class MyNet(pl.LightningModule):
             if "loss" in key:
                 self.log(key, np.mean(val), logger=True, prog_bar=False, batch_size=1, on_epoch=True, on_step=False)
 
+        # TODO: Plot training losses as well
+
+
         if self.args.mem:
             # Check memory consumption
             # Get GPU memory usage
@@ -633,442 +630,7 @@ class MyNet(pl.LightningModule):
         self.log("lr", self.trainer.optimizers[0].param_groups[0]['lr'], prog_bar=False, logger=True, batch_size=1)
 
     def test_step(self, batch, batch_idx):
-        batch_parts = self.my_step(batch, batch_idx, validation=True)
-        test_loss = batch_parts['loss'].item()
-
-        source, target = batch
-        sourcename = os.path.basename(source.source_dir)
-        source_path = os.path.join(self.logger.save_dir, "renders", sourcename)
-        save_path = os.path.join(self.logger.save_dir, "renders", sourcename, "frames")
-
-        # Loss dict
-        lossdict = batch_parts['lossdict']
-        keepidxs = source.keepidxs
-
-        # Construct mesh
-        mesh = Mesh(batch_parts["source_V"].detach().cpu().numpy(), batch_parts["ogT"])
-
-        # Log losses
-        for key, val in lossdict[0].items():
-            if "loss" in key:
-                self.log(f"val_{key}", np.mean(val), logger=True, prog_bar=False, batch_size=1, on_epoch=True, on_step=False)
-
-        if not os.path.exists(save_path):
-            Path(save_path).mkdir(exist_ok=True, parents=True)
-
-        # Save latest predictions
-        np.save(os.path.join(self.logger.save_dir, f"latest_preduv_{batch_idx}.npy"), batch_parts['pred_V'].squeeze().detach().cpu().numpy())
-        np.save(os.path.join(self.logger.save_dir, f"latest_predw_{batch_idx}.npy"), batch_parts['weights'])
-
-        np.save(os.path.join(self.logger.save_dir, f"latest_predt_{batch_idx}.npy"), batch_parts['T'])
-        np.save(os.path.join(self.logger.save_dir, f"latest_predj_{batch_idx}.npy"), batch_parts["pred_J"].squeeze().detach().cpu().numpy())
-
-        # if self.args.no_poisson:
-        #     np.save(os.path.join(source_path, f"latest_poissonuv.npy"), batch_parts['poissonUV'].squeeze().detach().cpu().numpy())
-        #     np.save(os.path.join(source_path, f"latest_poissont.npy"), batch_parts['ogT']) # NOTE: poisson T uses original triangles!
-
-        val_loss = batch_parts['loss'].item()
-        if self.args.xp_type == "uv":
-            # Plot the histogram of weights
-            if self.args.softpoisson or self.args.optweight:
-                import matplotlib.pyplot as plt
-                fig, axs = plt.subplots()
-                # plot ours
-                axs.set_title(f"Epoch {self.current_epoch:05}: SP Weights")
-                axs.hist(batch_parts['weights'], bins=20)
-                plt.savefig(os.path.join(save_path, f"weights_epoch_{self.current_epoch:05}_batch{batch_idx}.png"))
-                plt.close(fig)
-                plt.cla()
-                self.logger.log_image(key='weights', images=[os.path.join(save_path, f"weights_epoch_{self.current_epoch:05}_batch{batch_idx}.png")],
-                                      step=self.current_epoch)
-
-            # Texture images
-            # Save rendered images for debugging
-            if self.args.sdsloss:
-                import matplotlib.pyplot as plt
-
-                images = batch_parts['textureimgs']
-                num_views = 5
-                fig, axs = plt.subplots(int(np.ceil(num_views/5)), num_views)
-                for nview in range(num_views):
-                    j = nview % 5
-                    if nview > 5:
-                        i = nview // 5
-                        axs[i,j].imshow(images[nview].transpose(1,2,0))
-                        axs[i,j].axis('off')
-                    else:
-                        axs[j].imshow(images[nview].transpose(1,2,0))
-                        axs[j].axis('off')
-                plt.axis('off')
-                fig.suptitle(f"Epoch {self.current_epoch} Textures")
-                plt.savefig(os.path.join(save_path, f"{self.current_epoch:05}_{source.source_ind}_texture.png"))
-                plt.close(fig)
-                plt.cla()
-
-                # Log the plotted imgs
-                images = [os.path.join(save_path, f"{self.current_epoch:05}_{source.source_ind}_texture.png")]
-                self.logger.log_image(key='textures', images=images, step=self.current_epoch)
-
-            # NOTE: batch_parts['T'] = triangle soup indexing if no poisson solve
-            # If recutting Tutte: then plot the original tutte uvs
-            if (self.args.init in ["tutte", 'slim', 'isometric', 'precut'] and self.args.ninit == -1) or \
-                (self.current_epoch == 0 and self.args.init):
-                source = batch[0]
-                if self.args.init == "tutte":
-                    uv = source.tutteuv
-                    uvfs = source.cutfs
-                elif self.args.init == "slim":
-                    uv = source.slimuv
-                    uvfs = source.cutfs
-                elif self.args.init == "isometric":
-                    uv = source.isofuv.reshape(-1, 2)
-                    uvfs = np.arange(len(uv)).reshape(-1, 3)
-                elif self.args.init == "precut":
-                    uv = source.preuv.squeeze()
-                    uvfs = np.arange(len(uv)).reshape(-1, 3)
-                else:
-                    raise ValueError(f"Unknown init type: {self.args.init}")
-
-                plot_uv(save_path, f"{self.args.init} init epoch {self.current_epoch:05} batch {batch_idx}", uv.squeeze().detach().cpu().numpy(),
-                        uvfs, losses=None, facecolors = np.arange(len(uvfs))/(len(uvfs)),
-                        stitchweight=self.args.edgecut_weight)
-
-                # Also plot the full boundary
-                initfaces = batch_parts["ogT"]
-                cutmesh = Mesh(source.cutvs, source.cutfs)
-                totboundaries = []
-                for key, bd in sorted(cutmesh.topology.boundaries.items()):
-                    boundaryvs = []
-                    for v in bd.adjacentVertices():
-                        boundaryvs.append(cutmesh.vertices[v.index])
-                    bidx = np.array([[i, i+1] for i in range(len(boundaryvs)-1)] + [[len(boundaryvs)-1, 0]])
-                    totboundaries.append(np.array(boundaryvs)[bidx])
-                if len(totboundaries) > 0:
-                    totboundaries = np.concatenate(totboundaries, axis=0)
-                    export_views(source.cutvs, source.cutfs, save_path, filename=f"boundary_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
-                                    plotname=f"Initial Mesh Boundary Batch {batch_idx}", cylinders=totboundaries,
-                                    device="cpu", n_sample=30, width=200, height=200,
-                                    vmin=0, vmax=1, shading=False)
-
-            ### Compute cut edges based on stitching loss (on original topology and soup topology) ###
-            if 'edgeseparation' not in lossdict[0].keys():
-                edge_vpairs = source.edge_vpairs.detach().cpu().numpy()
-                uvpairs = batch_parts["pred_V"].squeeze()[edge_vpairs] # E x 2 x 2 x 2
-                uvpairs = uvpairs[keepidxs]
-
-                edgeseparation = torch.sum(torch.nn.functional.l1_loss(uvpairs[:,:,0,:], uvpairs[:,:,1,:], reduction='none'), dim=2)
-                edgeseparation = torch.mean(edgeseparation, dim=1).detach().cpu().numpy() # E x 1
-            else:
-                edgeseparation = lossdict[0]['edgeseparation']
-
-            topo_cutedges_stitch = np.where(edgeseparation > self.args.cuteps)[0]
-            topo_cutedgecolors_stitch = np.arange(len(edgeseparation))/(len(edgeseparation)-1)
-
-            # Convert to soup edges
-            # NOTE: We have to subset by keepidxs to get correct corr to edgeseparation
-            soup_cutedges_stitch = []
-            edge_vpairs = source.edge_vpairs.detach().cpu().numpy()[keepidxs]
-            for cute in topo_cutedges_stitch:
-                vpair = edge_vpairs[cute] # 2 x 2
-                soup_cutedges_stitch.append(batch_parts["pred_V"].squeeze()[vpair[:,0]].detach().cpu().numpy())
-                soup_cutedges_stitch.append(batch_parts["pred_V"].squeeze()[vpair[:,1]].detach().cpu().numpy())
-            soup_cutedgecolors_stitch = np.repeat(topo_cutedges_stitch, 2)/(len(edgeseparation)-1)
-
-            if len(soup_cutedges_stitch) > 0:
-                soup_cutedges_stitch = np.stack(soup_cutedges_stitch, axis=0) # CutE * 2 x 2 x 2
-
-            ### Compute cut edges based on weights (on original topology and soup topology) ###
-            weights = batch_parts['weights']
-            # assert len(weights) == len(edgeseparation), f"weights len: {len(weights)}, edgeseparation len: {len(edgeseparation)}"
-
-            topo_cutedges_weight = np.where(weights < self.args.weightcuteps)[0]
-            topo_cutedgecolors_weight = np.arange(len(weights))/(len(weights)-1)
-
-            # Convert to soup edges
-            soup_cutedges_weight = []
-            edge_vpairs = source.edge_vpairs.detach().cpu().numpy()
-            for cute in topo_cutedges_weight:
-                vpair = edge_vpairs[cute] # 2 x 2
-                soup_cutedges_weight.append(batch_parts["pred_V"].squeeze()[vpair[:,0]].detach().cpu().numpy())
-                soup_cutedges_weight.append(batch_parts["pred_V"].squeeze()[vpair[:,1]].detach().cpu().numpy())
-            soup_cutedgecolors_weight = np.repeat(topo_cutedges_weight, 2)/(len(weights)-1)
-
-            if len(soup_cutedges_weight) > 0:
-                soup_cutedges_weight = np.stack(soup_cutedges_weight, axis=0) # CutE * 2 x 2 x 2
-
-            # edges = None
-            # edgecolors = None
-            # vertexseparation = lossdict[0]['vertexseparation']
-
-            # edgestitchcheck = vertexseparation[source.edgeidxs].detach().cpu().numpy()
-            # cutvidxs = np.where(edgestitchcheck > self.args.cuteps)[0]
-            # cutsoup = [source.valid_edges_to_soup[vi] for vi in cutvidxs]
-
-            # # NOTE: There will be duplicates in cutsoup b/c every edge has two valid edge pairs
-            # # Remove the duplicates here
-            # dedupcutsoup = []
-            # dedupcutvidxs = []
-            # for i in range(len(cutsoup)):
-            #     souppair = cutsoup[i] # 2 x 2
-            #     if souppair not in dedupcutsoup:
-            #         dedupcutsoup.append(souppair)
-            #         dedupcutvidxs.append(cutvidxs[i])
-            # print(f"Original cutsoup #: {len(cutsoup)}. Number of dedup cut edges: {len(dedupcutsoup)}.")
-
-            # Dedup'd edge colors and cut edges
-            # NOTE: This ensures consistent coloring of each edge across different cuts
-            # edgecolors = np.repeat(np.array(source.edgededupidxs)[dedupcutvidxs]/(np.max(source.edgededupidxs) - 1), 2)
-            # edgecolors = np.repeat(dedupcutvidxs, 2)/(len(edgestitchcheck)-1)
-            # edges = []
-            # for souppair in dedupcutsoup:
-            #     edges.append(batch_parts["pred_V"].squeeze()[list(souppair[0])].detach().cpu().numpy())
-            #     edges.append(batch_parts["pred_V"].squeeze()[list(souppair[1])].detach().cpu().numpy())
-            # if len(edges) > 0:
-            #     edges = np.stack(edges, axis=0)
-
-            # Compute flips
-            from utils import get_flipped_triangles
-            flipped = get_flipped_triangles(batch_parts["pred_V"].squeeze().detach().cpu().numpy(), batch_parts['T'].squeeze())
-            flipvals = np.zeros(len(batch_parts['T'].squeeze()))
-            flipvals[flipped] = 1
-            lossdict[0]['fliploss'] = flipvals
-
-            if len(batch_parts["pred_V"].shape) == 4:
-                for idx in range(len(batch_parts["pred_V"])):
-                    plot_uv(save_path, f"epoch {self.current_epoch:05} batch {idx:05}", batch_parts["pred_V"][idx].squeeze().detach().cpu().numpy(),
-                            batch_parts["T"][idx].squeeze(), losses=lossdict[idx], cmin=0, cmax=2, dmin=0, dmax=1,
-                            facecolors = np.arange(len(batch_parts["T"][idx].squeeze()))/(len(batch_parts["T"][idx].squeeze())),
-                            edges = soup_cutedges_stitch, edgecolors = soup_cutedgecolors_stitch,
-                            edgecorrespondences=source.edgecorrespondences, source=source,
-                            keepidxs = keepidxs, stitchweight=self.args.edgecut_weight)
-            else:
-                plot_uv(save_path, f"epoch {self.current_epoch:05} batch {batch_idx}", batch_parts["pred_V"].squeeze().detach().cpu().numpy(),
-                        batch_parts["T"].squeeze(), losses=lossdict[0], cmin=0, cmax=2, dmin=0, dmax=1,
-                        facecolors = np.arange(len(batch_parts["T"].squeeze()))/(len(batch_parts["T"].squeeze())),
-                        edges = soup_cutedges_stitch, edgecolors = soup_cutedgecolors_stitch,
-                        edgecorrespondences=source.edgecorrespondences, source=source,
-                        keepidxs = keepidxs, stitchweight=self.args.edgecut_weight)
-
-            # Log the plotted imgs
-            images = [os.path.join(save_path, f"epoch_{self.current_epoch:05}_batch_{batch_idx}.png")] + \
-                        [os.path.join(save_path, f"{key}_epoch_{self.current_epoch:05}_batch_{batch_idx}.png") for key in lossdict[0].keys() if "loss" in key]
-
-            if self.args.init in ['tutte', 'slim', 'isometric', 'precut'] and self.args.ninit == -1:
-                images = [os.path.join(save_path, f"{self.args.init}_init_epoch_{self.current_epoch:05}_batch_{batch_idx}.png")] + images
-            elif self.current_epoch == 0 and self.args.init:
-                images = [os.path.join(save_path, f"{self.args.init}_init_epoch_{self.current_epoch:05}_batch_{batch_idx}.png")] + images
-
-            # Filter out all renders that dont exist
-            images = [imgpath for imgpath in images if os.path.exists(imgpath)]
-            self.logger.log_image(key='uvs', images=images, step=self.current_epoch)
-
-            #### Compute and plot hard soft poisson ####
-            # NOTE: We only look at valid edge pairs to cut, even if LEARNING is done over all valid pairs!
-            # May also set weights based on the stitching loss instead
-            if self.args.hardpoisson:
-                if self.args.hardpoisson == "loss":
-                    # NOTE: Edge stitch check is L2 distances between corresponding vertices!
-                    edgeweights = edgeseparation
-                    threshold = self.args.cuteps
-                elif self.args.hardpoisson == "weight":
-                    edgeweights = weights
-                    threshold = self.args.weightcuteps
-
-                hardpoisson_uv, cutvs, cutfs, seamlengths, hardpoisson_cuts = self.hardpoisson(source, batch_parts['pred_J'], batch_parts['source_V'],
-                                                                                torch.from_numpy(batch_parts['ogT']).to(self.device), edgeweights,
-                                                                                vertex_pairs = source.valid_edge_pairs,
-                                                                                threshold = threshold)
-                hardpoisson_uv = hardpoisson_uv[:, :2]
-
-                # Compute seam length and distortion
-                # NOTE: We only have ARAP implemented for now
-                from source_njf.losses import arap
-                distortionenergy = arap(torch.from_numpy(cutvs).float(), torch.from_numpy(cutfs).long(), hardpoisson_uv,
-                                        device=self.device, renormalize=False,
-                                        return_face_energy=True, timeit=False)
-
-                # Visualize the edge cuts
-                hp_ecolors, hp_edges = None, None
-                hardpoisson_uv = hardpoisson_uv.squeeze().detach().cpu().numpy()
-
-                plot_uv(save_path, f"hard poisson epoch {self.current_epoch:05} seam length {np.sum(seamlengths):04f}", hardpoisson_uv,
-                            cutfs, losses={'distortionloss': distortionenergy.detach().cpu().numpy()},
-                            edges = hp_edges, edgecolors=hp_ecolors, keepidxs = keepidxs,
-                            facecolors = np.arange(len(cutfs))/(len(cutfs)), stitchweight=self.args.edgecut_weight)
-
-                images = [os.path.join(save_path, f"hard_poisson_epoch_{self.current_epoch:05}_seam_length_{np.sum(seamlengths):04f}.png")] + \
-                        [os.path.join(save_path, f"distortionloss_hard_poisson_epoch_{self.current_epoch:05}_seam_length_{np.sum(seamlengths):04f}.png")]
-                self.logger.log_image(key='hard poisson', images=images, step=self.current_epoch)
-
-            ### Losses on 3D surfaces
-            ### NOTE: mesh is original mesh topology (not soup)
-
-            # Plot edge cuts
-            ogvs = batch_parts["source_V"].detach().cpu().numpy()
-            ogfs = batch_parts["ogT"]
-
-            topo_cutvpairs = source.ogedge_vpairs_nobound[topo_cutedges_stitch]
-            cylinderpos = ogvs[topo_cutvpairs]
-            cutlen = torch.sum(source.elens_nobound[topo_cutedges_stitch]).item()
-
-            # Stitch cut
-            if len(cylinderpos) > 0:
-                export_views(ogvs, batch_parts["ogT"], save_path, filename=f"stitchcuts_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
-                            plotname=f"Total stitchcut len: {cutlen:0.5f}", cylinders=cylinderpos,
-                            outline_width=0.01, cmap = plt.get_cmap('Reds_r'),
-                            device="cpu", n_sample=30, width=200, height=200,
-                            vmin=0, vmax=1, shading=False)
-
-            # Weight cut
-            topo_cutvpairs = source.ogedge_vpairs_nobound[topo_cutedges_weight]
-            cylinderpos = ogvs[topo_cutvpairs]
-            cutlen = torch.sum(source.elens_nobound[topo_cutedges_weight]).item()
-
-            if len(cylinderpos) > 0:
-                export_views(ogvs, batch_parts["ogT"], save_path, filename=f"weightcuts_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
-                            plotname=f"Total weight cut len: {cutlen:0.5f}", cylinders=cylinderpos,
-                            outline_width=0.01, cmap = plt.get_cmap('Reds_r'),
-                            device="cpu", n_sample=30, width=200, height=200,
-                            vmin=0, vmax=1, shading=False)
-
-            # Weights
-            # NOTE: below results in 2x each cylinder but it's fine
-            cylinderpos = ogvs[source.ogedge_vpairs_nobound.detach().cpu().numpy()]
-            cylindervals = np.stack([weights, weights], axis=1) # E x 2
-
-            export_views(ogvs, batch_parts["ogT"], save_path, filename=f"weights_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
-                        plotname=f"Edge Weights", cylinders=cylinderpos,
-                        cylinder_scalars=cylindervals,
-                        outline_width=0.01, cmap = plt.get_cmap('Reds_r'),
-                        device="cpu", n_sample=30, width=200, height=200,
-                        vmin=0, vmax=1, shading=False)
-
-            images = [os.path.join(save_path, f"weights_mesh_{self.current_epoch:05}_batch{batch_idx}.png")]
-            # if os.path.exists(os.path.join(save_path, f"weightcuts_mesh_{self.current_epoch:05}_batch{batch_idx}.png")):
-            #     images.append(os.path.join(save_path, f"weightcuts_mesh_{self.current_epoch:05}_batch{batch_idx}.png"))
-            if (self.args.init in ["tutte", "slim"] and self.args.ninit == -1) or \
-                (self.current_epoch == 0 and self.args.init):
-                boundary_path = os.path.join(save_path, f"boundary_mesh_{self.current_epoch:05}_batch{batch_idx}.png")
-                if os.path.exists(boundary_path):
-                    images = [boundary_path] + images
-            self.logger.log_image(key='pred weight', images=images, step=self.current_epoch)
-
-            edgecorrespondences = source.edgecorrespondences
-            for key, val in lossdict[0].items():
-                if "loss" in key: # Hacky way of avoiding aggregated values
-                    if key == "vertexseploss":
-                        ogvs = batch_parts["source_V"].detach().cpu().numpy()
-                        valid_pairs = source.valid_pairs
-                        separationloss = val
-
-                        # Convert separation loss to per vertex
-                        from collections import defaultdict
-                        vlosses = defaultdict(np.double)
-                        vlosscount = defaultdict(int)
-                        for i in range(len(valid_pairs)):
-                            pair = valid_pairs[i]
-                            vlosses[pair[0]] += separationloss[i]
-                            vlosses[pair[1]] += separationloss[i]
-                            vlosscount[pair[0]] += 1
-                            vlosscount[pair[1]] += 1
-
-                        # NOTE: Not all vertices will be covered in vlosses b/c they are boundary vertices
-                        vseplosses = np.zeros(len(batch_parts['pred_V'])) # Soup vs
-                        for k, v in sorted(vlosses.items()):
-                            vseplosses[k] = v / vlosscount[k]
-
-                        # NOTE: can't let mesh re-export the faces because the indexing will be off
-                        export_views(ogvs, batch_parts["ogT"], save_path, filename=f"{key}_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
-                                    plotname=f"Avg {key}: {np.mean(val):0.4f}", outline_width=0.01,
-                                    vcolor_vals=vseplosses,
-                                    device="cpu", n_sample=30, width=200, height=200,
-                                    vmin=0, vmax=0.5, shading=False)
-
-                    elif key == "edgecutloss":
-                        from collections import defaultdict
-                        edgecutloss = val # E x 1
-                        cylinderpos = ogvs[source.ogedge_vpairs_nobound[keepidxs].detach().cpu().numpy()]
-                        cylindervals = np.stack([edgecutloss, edgecutloss], axis=1) # E x 2
-
-                        ## Also plot edges which are excluded by keepidxs
-                        excludeidxs = np.setdiff1d(np.arange(len(source.ogedge_vpairs_nobound)), keepidxs)
-                        subcylinders = ogvs[source.ogedge_vpairs_nobound[excludeidxs].detach().cpu().numpy()]
-
-                        if len(subcylinders) == 0:
-                            subcylinders = None
-
-                        export_views(ogvs, batch_parts["ogT"], save_path, filename=f"{key}_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
-                                    plotname=f"Avg {key}: {np.mean(val):0.4f}", cylinders=cylinderpos,
-                                    cylinder_scalars=cylindervals, outline_width=0.01,
-                                    device="cpu", n_sample=30, width=200, height=200,
-                                    vmin=0, vmax=self.args.edgecut_weight, shading=False,
-                                    subcylinders = subcylinders)
-
-                    elif key == "gtweightloss":
-                        from collections import defaultdict
-                        cylinderpos = ogvs[source.ogedge_vpairs_nobound.detach().cpu().numpy()]
-                        cylindervals = np.stack([val, val], axis=1) # E x 2
-
-                        export_views(ogvs, batch_parts["ogT"], save_path, filename=f"{key}_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
-                                    plotname=f"Avg {key}: {np.mean(val):0.4f}", cylinders=cylinderpos,
-                                    cylinder_scalars=cylindervals, outline_width=0.01,
-                                    device="cpu", n_sample=30, width=200, height=200,
-                                    vmin=0, vmax=1, shading=False)
-
-                    elif key == "edgegradloss": # E x 2
-                        cylindervals = []
-                        cylinderpos = []
-                        ogvs = batch_parts["source_V"].detach().cpu().numpy()
-                        count = 0
-                        for k, v in sorted(edgecorrespondences.items()):
-                            # If only one correspondence, then it is a boundary
-                            if len(v) == 1:
-                                continue
-                            cylinderpos.append(ogvs[list(k)])
-                            cylindervals.append([np.sum(val[count]), np.sum(val[count])])
-                            count += 1
-
-                        export_views(ogvs, batch_parts["ogT"], save_path, filename=f"{key}_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
-                                    plotname=f"Avg {key}: {np.mean(val):0.4f}", cylinders=cylinderpos,
-                                    cylinder_scalars=cylindervals, outline_width=0.01,
-                                    device="cpu", n_sample=30, width=200, height=200,
-                                    vmin=0, vmax=0.5, shading=False)
-                    # Face-based losses
-                    elif key in ["distortionloss", "gtjloss"]:
-                        export_views(batch_parts["source_V"].detach().cpu().numpy(), batch_parts["ogT"], save_path,
-                                     filename=f"{key}_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
-                                        plotname=f"Avg {key}: {np.mean(val):0.4f}",
-                                        fcolor_vals=val, device="cpu", n_sample=30, width=200, height=200,
-                                        vmin=0, vmax=1, shading=False)
-                    elif key == "gtuvloss":
-                        export_views(batch_parts["source_V"].detach().cpu().numpy(), batch_parts["ogT"], save_path,
-                                     filename=f"{key}_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
-                                        plotname=f"Avg {key}: {np.mean(val):0.4f}",
-                                        vcolor_vals=val, device="cpu", n_sample=30, width=200, height=200,
-                                        vmin=0, vmax=1, shading=False)
-                    elif key == "fliploss":
-                        export_views(batch_parts["source_V"].detach().cpu().numpy(), batch_parts["ogT"], save_path,
-                                     filename=f"{key}_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
-                                        plotname=f"Avg {key}: {np.mean(val):0.4f}",
-                                        fcolor_vals=val, device="cpu", n_sample=30, width=200, height=200,
-                                        vmin=0, vmax=0.6, shading=False)
-                    elif key == "intersectionloss":
-                        export_views(batch_parts["source_V"].detach().cpu().numpy(), batch_parts["ogT"], save_path,
-                                     filename=f"{key}_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
-                                        plotname=f"Avg {key}: {np.mean(val):0.4f}",
-                                        fcolor_vals=val, device="cpu", n_sample=30, width=200, height=200,
-                                        vmin=0, vmax=1, shading=False)
-                    else:
-                        continue
-
-            # Log together: 3D surface losses + initial tutte cut
-            images = [os.path.join(save_path, f"{key}_mesh_{self.current_epoch:05}_batch{batch_idx}.png") for key in lossdict[0].keys() if "loss" in key]
-
-            # Filter out all renders that dont exist
-            images = [imgpath for imgpath in images if os.path.exists(imgpath)]
-            self.logger.log_image(key='3D losses', images=images, step=self.current_epoch)
-
-        return test_loss
+        return self.validation_step(batch, batch_idx)
 
     def get_gt_map(self, source, target, softpoisson=False):
         GT_V = target.get_vertices()
@@ -1077,6 +639,28 @@ class MyNet(pl.LightningModule):
         GT_J = source.jacobians_from_vertices(GT_V)
         GT_J_restricted = source.restrict_jacobians(GT_J)
         return GT_V, GT_J, GT_J_restricted
+
+    def predict_uv(self, source, target, initfuv = None):
+        stacked = source.get_input_features()
+        vertexz, facez = self.forward(stacked, source)
+
+        # Concat vertex and face codes based on soup topology
+        # NOTE: must be in order of vs[fs].reshape(-1, 2) (i.e. fvs)
+        faces = source.get_loaded_data('faces')
+        vertexcodes = vertexz[faces].reshape(-1, vertexz.shape[1])
+        vertexcodes = torch.cat([vertexcodes, torch.repeat_interleave(facez, 3, dim = 0)], dim=1)
+
+        # Condition on initfuvs if given
+        if initfuv is not None:
+            vertexcodes = torch.cat([vertexcodes, initfuv.reshape(-1, 2)], dim=1)
+
+        pred_uvs = self.uvdecoder(vertexcodes).squeeze() # F * 3 x 2
+
+        # Delta against initial UVs (must be fuv format)
+        if self.args.init and initfuv is not None:
+            pred_uvs = pred_uvs + initfuv.reshape(-1, 2)
+
+        return pred_uvs
 
     def predict_map(self, source, target, initj=None):
         if self.args.softpoisson or self.args.optweight:
@@ -1149,6 +733,7 @@ class MyNet(pl.LightningModule):
             return val_loss
 
         ### Visualizations
+        import matplotlib.pyplot as plt
 
         # Log path
         source, target = batch
@@ -1173,10 +758,11 @@ class MyNet(pl.LightningModule):
 
         # Save latest predictions
         np.save(os.path.join(self.logger.save_dir, f"latest_preduv_{batch_idx}.npy"), batch_parts['pred_V'].squeeze().detach().cpu().numpy())
-        np.save(os.path.join(self.logger.save_dir, f"latest_predw_{batch_idx}.npy"), batch_parts['weights'])
-
         np.save(os.path.join(self.logger.save_dir, f"latest_predt_{batch_idx}.npy"), batch_parts['T'])
-        np.save(os.path.join(self.logger.save_dir, f"latest_predj_{batch_idx}.npy"), batch_parts["pred_J"].squeeze().detach().cpu().numpy())
+
+        if self.args.softpoisson:
+            np.save(os.path.join(self.logger.save_dir, f"latest_predw_{batch_idx}.npy"), batch_parts['weights'])
+            np.save(os.path.join(self.logger.save_dir, f"latest_predj_{batch_idx}.npy"), batch_parts["pred_J"].squeeze().detach().cpu().numpy())
 
         # if self.args.no_poisson:
         #     np.save(os.path.join(source_path, f"latest_poissonuv.npy"), batch_parts['poissonUV'].squeeze().detach().cpu().numpy())
@@ -1186,7 +772,6 @@ class MyNet(pl.LightningModule):
         if self.args.xp_type == "uv":
             # Plot the histogram of weights
             if self.args.softpoisson or self.args.optweight:
-                import matplotlib.pyplot as plt
                 fig, axs = plt.subplots()
                 # plot ours
                 axs.set_title(f"Epoch {self.current_epoch:05}: SP Weights")
@@ -1268,7 +853,7 @@ class MyNet(pl.LightningModule):
             ### Compute cut edges based on stitching loss (on original topology and soup topology) ###
             if 'edgeseparation' not in lossdict[0].keys():
                 edge_vpairs = source.edge_vpairs.detach().cpu().numpy()
-                uvpairs = batch_parts["pred_V"].squeeze()[edge_vpairs] # E x 2 x 2 x 2
+                uvpairs = batch_parts["pred_V"].squeeze()[edge_vpairs, :] # E x 2 x 2 x 2
                 uvpairs = uvpairs[keepidxs]
 
                 edgeseparation = torch.sum(torch.nn.functional.l1_loss(uvpairs[:,:,0,:], uvpairs[:,:,1,:], reduction='none'), dim=2)
@@ -1293,53 +878,24 @@ class MyNet(pl.LightningModule):
                 soup_cutedges_stitch = np.stack(soup_cutedges_stitch, axis=0) # CutE * 2 x 2 x 2
 
             ### Compute cut edges based on weights (on original topology and soup topology) ###
-            weights = batch_parts['weights']
-            # assert len(weights) == len(edgeseparation), f"weights len: {len(weights)}, edgeseparation len: {len(edgeseparation)}"
+            if "weights" in batch_parts.keys():
+                weights = batch_parts['weights']
+                # assert len(weights) == len(edgeseparation), f"weights len: {len(weights)}, edgeseparation len: {len(edgeseparation)}"
 
-            topo_cutedges_weight = np.where(weights < self.args.weightcuteps)[0]
-            topo_cutedgecolors_weight = np.arange(len(weights))/(len(weights)-1)
+                topo_cutedges_weight = np.where(weights < self.args.weightcuteps)[0]
+                topo_cutedgecolors_weight = np.arange(len(weights))/(len(weights)-1)
 
-            # Convert to soup edges
-            soup_cutedges_weight = []
-            edge_vpairs = source.edge_vpairs.detach().cpu().numpy()
-            for cute in topo_cutedges_weight:
-                vpair = edge_vpairs[cute] # 2 x 2
-                soup_cutedges_weight.append(batch_parts["pred_V"].squeeze()[vpair[:,0]].detach().cpu().numpy())
-                soup_cutedges_weight.append(batch_parts["pred_V"].squeeze()[vpair[:,1]].detach().cpu().numpy())
-            soup_cutedgecolors_weight = np.repeat(topo_cutedges_weight, 2)/(len(weights)-1)
+                # Convert to soup edges
+                soup_cutedges_weight = []
+                edge_vpairs = source.edge_vpairs.detach().cpu().numpy()
+                for cute in topo_cutedges_weight:
+                    vpair = edge_vpairs[cute] # 2 x 2
+                    soup_cutedges_weight.append(batch_parts["pred_V"].squeeze()[vpair[:,0]].detach().cpu().numpy())
+                    soup_cutedges_weight.append(batch_parts["pred_V"].squeeze()[vpair[:,1]].detach().cpu().numpy())
+                soup_cutedgecolors_weight = np.repeat(topo_cutedges_weight, 2)/(len(weights)-1)
 
-            if len(soup_cutedges_weight) > 0:
-                soup_cutedges_weight = np.stack(soup_cutedges_weight, axis=0) # CutE * 2 x 2 x 2
-
-            # edges = None
-            # edgecolors = None
-            # vertexseparation = lossdict[0]['vertexseparation']
-
-            # edgestitchcheck = vertexseparation[source.edgeidxs].detach().cpu().numpy()
-            # cutvidxs = np.where(edgestitchcheck > self.args.cuteps)[0]
-            # cutsoup = [source.valid_edges_to_soup[vi] for vi in cutvidxs]
-
-            # # NOTE: There will be duplicates in cutsoup b/c every edge has two valid edge pairs
-            # # Remove the duplicates here
-            # dedupcutsoup = []
-            # dedupcutvidxs = []
-            # for i in range(len(cutsoup)):
-            #     souppair = cutsoup[i] # 2 x 2
-            #     if souppair not in dedupcutsoup:
-            #         dedupcutsoup.append(souppair)
-            #         dedupcutvidxs.append(cutvidxs[i])
-            # print(f"Original cutsoup #: {len(cutsoup)}. Number of dedup cut edges: {len(dedupcutsoup)}.")
-
-            # Dedup'd edge colors and cut edges
-            # NOTE: This ensures consistent coloring of each edge across different cuts
-            # edgecolors = np.repeat(np.array(source.edgededupidxs)[dedupcutvidxs]/(np.max(source.edgededupidxs) - 1), 2)
-            # edgecolors = np.repeat(dedupcutvidxs, 2)/(len(edgestitchcheck)-1)
-            # edges = []
-            # for souppair in dedupcutsoup:
-            #     edges.append(batch_parts["pred_V"].squeeze()[list(souppair[0])].detach().cpu().numpy())
-            #     edges.append(batch_parts["pred_V"].squeeze()[list(souppair[1])].detach().cpu().numpy())
-            # if len(edges) > 0:
-            #     edges = np.stack(edges, axis=0)
+                if len(soup_cutedges_weight) > 0:
+                    soup_cutedges_weight = np.stack(soup_cutedges_weight, axis=0) # CutE * 2 x 2 x 2
 
             # Compute flips
             from utils import get_flipped_triangles
@@ -1347,6 +903,17 @@ class MyNet(pl.LightningModule):
             flipvals = np.zeros(len(batch_parts['T'].squeeze()))
             flipvals[flipped] = 1
             lossdict[0]['fliploss'] = flipvals
+
+            # Compute distortion if not already in loss
+            if 'distortionloss' not in lossdict[0].keys():
+                from source_njf.losses import arap
+                distortionenergy = arap(batch_parts["source_V"], torch.from_numpy(batch_parts["ogT"]).to(self.device),
+                                        batch_parts["pred_V"],
+                                        paramtris = batch_parts["pred_V"].reshape(-1, 3, 2),
+                                        device=self.device,
+                                        renormalize=False,
+                                        return_face_energy=True, timeit=False)
+                lossdict[0]['distortionloss'] = distortionenergy.detach().cpu().numpy()
 
             if len(batch_parts["pred_V"].shape) == 4:
                 for idx in range(len(batch_parts["pred_V"])):
@@ -1368,10 +935,12 @@ class MyNet(pl.LightningModule):
             images = [os.path.join(save_path, f"epoch_{self.current_epoch:05}_batch_{batch_idx}.png")] + \
                         [os.path.join(save_path, f"{key}_epoch_{self.current_epoch:05}_batch_{batch_idx}.png") for key in lossdict[0].keys() if "loss" in key]
 
-            if self.args.init in ['tutte', 'slim', 'isometric', 'precut'] and self.args.ninit == -1:
+            if self.args.init:
                 images = [os.path.join(save_path, f"{self.args.init}_init_epoch_{self.current_epoch:05}_batch_{batch_idx}.png")] + images
-            elif self.current_epoch == 0 and self.args.init:
-                images = [os.path.join(save_path, f"{self.args.init}_init_epoch_{self.current_epoch:05}_batch_{batch_idx}.png")] + images
+
+            # Log GT UVs
+            if self.args.gtuvloss or self.args.gtnetworkloss:
+                images = [os.path.join(source.source_dir, "..", "..", "gtuv.png")] + images
 
             # Filter out all renders that dont exist
             images = [imgpath for imgpath in images if os.path.exists(imgpath)]
@@ -1435,30 +1004,33 @@ class MyNet(pl.LightningModule):
                             vmin=0, vmax=1, shading=False)
 
             # Weight cut
-            topo_cutvpairs = source.ogedge_vpairs_nobound[topo_cutedges_weight]
-            cylinderpos = ogvs[topo_cutvpairs]
-            cutlen = torch.sum(source.elens_nobound[topo_cutedges_weight]).item()
+            images = []
+            if "weights" in batch_parts.keys():
+                topo_cutvpairs = source.ogedge_vpairs_nobound[topo_cutedges_weight]
+                cylinderpos = ogvs[topo_cutvpairs]
+                cutlen = torch.sum(source.elens_nobound[topo_cutedges_weight]).item()
 
-            if len(cylinderpos) > 0:
-                export_views(ogvs, batch_parts["ogT"], save_path, filename=f"weightcuts_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
-                            plotname=f"Total weight cut len: {cutlen:0.5f}", cylinders=cylinderpos,
+                if len(cylinderpos) > 0:
+                    export_views(ogvs, batch_parts["ogT"], save_path, filename=f"weightcuts_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
+                                plotname=f"Total weight cut len: {cutlen:0.5f}", cylinders=cylinderpos,
+                                outline_width=0.01, cmap = plt.get_cmap('Reds_r'),
+                                device="cpu", n_sample=30, width=200, height=200,
+                                vmin=0, vmax=1, shading=False)
+
+                # Weights
+                # NOTE: below results in 2x each cylinder but it's fine
+                cylinderpos = ogvs[source.ogedge_vpairs_nobound.detach().cpu().numpy()]
+                cylindervals = np.stack([weights, weights], axis=1) # E x 2
+
+                export_views(ogvs, batch_parts["ogT"], save_path, filename=f"weights_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
+                            plotname=f"Edge Weights", cylinders=cylinderpos,
+                            cylinder_scalars=cylindervals,
                             outline_width=0.01, cmap = plt.get_cmap('Reds_r'),
                             device="cpu", n_sample=30, width=200, height=200,
                             vmin=0, vmax=1, shading=False)
 
-            # Weights
-            # NOTE: below results in 2x each cylinder but it's fine
-            cylinderpos = ogvs[source.ogedge_vpairs_nobound.detach().cpu().numpy()]
-            cylindervals = np.stack([weights, weights], axis=1) # E x 2
+                images = [os.path.join(save_path, f"weights_mesh_{self.current_epoch:05}_batch{batch_idx}.png")]
 
-            export_views(ogvs, batch_parts["ogT"], save_path, filename=f"weights_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
-                        plotname=f"Edge Weights", cylinders=cylinderpos,
-                        cylinder_scalars=cylindervals,
-                        outline_width=0.01, cmap = plt.get_cmap('Reds_r'),
-                        device="cpu", n_sample=30, width=200, height=200,
-                        vmin=0, vmax=1, shading=False)
-
-            images = [os.path.join(save_path, f"weights_mesh_{self.current_epoch:05}_batch{batch_idx}.png")]
             # if os.path.exists(os.path.join(save_path, f"weightcuts_mesh_{self.current_epoch:05}_batch{batch_idx}.png")):
             #     images.append(os.path.join(save_path, f"weightcuts_mesh_{self.current_epoch:05}_batch{batch_idx}.png"))
             if (self.args.init in ["tutte", "slim"] and self.args.ninit == -1) or \
@@ -1466,6 +1038,15 @@ class MyNet(pl.LightningModule):
                 boundary_path = os.path.join(save_path, f"boundary_mesh_{self.current_epoch:05}_batch{batch_idx}.png")
                 if os.path.exists(boundary_path):
                     images = [boundary_path] + images
+
+            # Initial cuts
+            if os.path.exists(os.path.join(source.source_dir, "..", "..", "initcuts.png")):
+                images = [os.path.join(source.source_dir, "..", "..", "initcuts.png")] + images
+
+            # GT Cuts
+            if os.path.exists(os.path.join(source.source_dir, "..", "..", "gtcuts.png")):
+                images = [os.path.join(source.source_dir, "..", "..", "gtcuts.png")] + images
+
             self.logger.log_image(key='pred weight', images=images, step=self.current_epoch)
 
             edgecorrespondences = source.edgecorrespondences
@@ -1549,7 +1130,7 @@ class MyNet(pl.LightningModule):
                                     device="cpu", n_sample=30, width=200, height=200,
                                     vmin=0, vmax=0.5, shading=False)
 
-                    elif key in ["distortionloss", "gtjloss"]:
+                    elif key in ["distortionloss", "gtjloss", "normalloss"]:
                         export_views(batch_parts["source_V"].detach().cpu().numpy(), batch_parts["ogT"], save_path,
                                      filename=f"{key}_mesh_{self.current_epoch:05}_batch{batch_idx}.png",
                                         plotname=f"Avg {key}: {np.mean(val):0.4f}",
@@ -1643,16 +1224,18 @@ class MyNet(pl.LightningModule):
         vertices = torch.from_numpy(vs).float().to(self.device)
         faces = torch.from_numpy(fs).long().to(self.device)
 
-        if self.args.softpoisson or self.args.optweight:
-            pred_V, pred_J, pred_J_poiss, pred_J_restricted_poiss, weights = self.predict_map(source, target, initj=initj if initj is not None else None)
+        pred_V = pred_J = pred_J_poiss = pred_J_restricted_poiss = weights = None
+        if self.args.directuv:
+            preduv = self.predict_uv(source, target, initfuv = initfuv)
         else:
-            pred_V, pred_J, pred_J_poiss, pred_J_restricted_poiss = self.predict_map(source, target, initj=initj if initj is not None else None)
+            if self.args.softpoisson or self.args.optweight:
+                pred_V, pred_J, pred_J_poiss, pred_J_restricted_poiss, weights = self.predict_map(source, target, initj=initj if initj is not None else None)
+            else:
+                pred_V, pred_J, pred_J_poiss, pred_J_restricted_poiss = self.predict_map(source, target, initj=initj if initj is not None else None)
 
-        # TODO: individual J/weight optimization -- check what happens if we start with ideal Jacobs and optimize just the weights
-
-        # Drop last dimension of restricted J
-        if pred_J_restricted_poiss.shape[2] == 3:
-            pred_J_restricted_poiss = pred_J_restricted_poiss[:,:,:2]
+            # Drop last dimension of restricted J
+            if pred_J_restricted_poiss.shape[2] == 3:
+                pred_J_restricted_poiss = pred_J_restricted_poiss[:,:,:2]
 
         ## Stitching loss schedule
         if self.args.stitchschedule == "linear":
@@ -1688,11 +1271,23 @@ class MyNet(pl.LightningModule):
             sparsecuts_weight = self.args.stitchlossweight_max - 0.5 * (self.args.stitchlossweight_max - self.args.stitchlossweight_min) * (1 + np.cos(np.pi * ratio))
             self.args.sparsecuts_weight = sparsecuts_weight
 
+        normalgrid = None
+        if self.args.normalloss:
+            # NOTE: assumes batch size is always 1
+            normalgrid = self.trainer.optimizers[0].param_groups[1]['params'][batch_idx]
+
         # NOTE predict_map already composites pred_J against initj
-        pred_V = pred_V[:, :, :2].squeeze().reshape(-1, 3, 2)
-        loss = self.lossfcn.computeloss(vertices, faces, ZeroNanGrad.apply(pred_V), ZeroNanGrad.apply(pred_J_poiss[:,:,:2,:]),
-                                        weights=weights, stitchweights=self.stitchweights[batch_idx],
-                                        source=source, keepidxs=source.keepidxs, mesh = mesh, predj = pred_J)
+        if self.args.directuv:
+            loss = self.lossfcn.computeloss(vertices, faces, preduv.reshape(-1, 3, 2),
+                                            weights=weights, stitchweights=self.stitchweights[batch_idx],
+                                            source=source, keepidxs=source.keepidxs, mesh = mesh,
+                                            normalgrid=normalgrid)
+        else:
+            pred_V = pred_V[:, :, :2].squeeze().reshape(-1, 3, 2)
+            loss = self.lossfcn.computeloss(vertices, faces, ZeroNanGrad.apply(pred_V), ZeroNanGrad.apply(pred_J_poiss[:,:,:2,:]),
+                                            weights=weights, stitchweights=self.stitchweights[batch_idx],
+                                            source=source, keepidxs=source.keepidxs, mesh = mesh, predj = pred_J,
+                                            normalgrid=normalgrid)
 
         lossrecord = self.lossfcn.exportloss()
         self.lossfcn.clear() # This resets the loss record dictionary
@@ -1782,45 +1377,65 @@ class MyNet(pl.LightningModule):
         if self.verbose:
             print(
                 f"batch of {target.get_vertices().shape[0]:d} source <--> target pairs, each mesh {target.get_vertices().shape[1]:d} vertices, {source.get_source_triangles().shape[1]:d} faces")
-        ret = {
-            "target_V": vertices.detach(),
-            "source_V": vertices.detach(),
-            "pred_V": pred_V.detach(),
-            "pred_J": pred_J.detach(),
-            "T": faces.detach().cpu().numpy(),
-            'source_ind': source.source_ind,
-            'target_inds': target.target_inds,
-            "lossdict": lossrecord,
-            "loss": loss,
-        }
 
-        if self.args.sdsloss:
-            ret['textureimgs'] = rgb_images[0]['image'].detach().cpu().numpy()
+        if self.args.directuv:
+            ret = {
+                "target_V": vertices.detach(),
+                "source_V": vertices.detach(),
+                "pred_V": preduv.detach(),
+                'T': np.arange(len(faces) * 3).reshape(len(faces), 3),
+                "ogT": faces.detach().cpu().numpy(),
+                'source_ind': source.source_ind,
+                'target_inds': target.target_inds,
+                "lossdict": lossrecord,
+                "loss": loss,
+            }
 
-        if self.args.softpoisson or self.args.optweight:
-            ret['weights'] = weights.detach().cpu().numpy()
+            if self.args.sdsloss:
+                ret['textureimgs'] = rgb_images[0]['image'].detach().cpu().numpy()
 
-        # Need to adjust the return values if no poisson solve
-        if self.args.no_poisson and len(pred_V) == len(faces):
-            ret['pred_V'] = pred_V.detach().reshape(-1, 2)
+            return ret
 
-            # Triangle soup
-            ret['ogT'] = ret['T'] # Save original triangle indices
-            ret['T'] = np.arange(len(faces)*3).reshape(len(faces), 3)
+        else:
+            ret = {
+                "target_V": vertices.detach(),
+                "source_V": vertices.detach(),
+                "pred_V": pred_V.detach(),
+                "pred_J": pred_J.detach(),
+                "T": faces.detach().cpu().numpy(),
+                'source_ind': source.source_ind,
+                'target_inds': target.target_inds,
+                "lossdict": lossrecord,
+                "loss": loss,
+            }
 
-            # Debugging: predicted fuvs make sense
-            if self.args.debug:
-                import matplotlib.pyplot as plt
-                fig, axs = plt.subplots(figsize=(6, 4))
-                axs.triplot(ret['pred_V'][:,0].detach().cpu().numpy(), ret['pred_V'][:,1].detach().cpu().numpy(), ret['T'], linewidth=0.5)
-                plt.axis('off')
-                plt.savefig(f"scratch/{source.source_ind}_fuv_pred.png")
-                plt.close(fig)
-                plt.cla()
+            if self.args.sdsloss:
+                ret['textureimgs'] = rgb_images[0]['image'].detach().cpu().numpy()
 
-        # if self.args.test:
-        #     ret['pred_J_R'] = poisson_J_restricted.detach()
-        #     ret['target_J_R'] = GT_J_restricted.detach()
+            if self.args.softpoisson or self.args.optweight:
+                ret['weights'] = weights.detach().cpu().numpy()
+
+            # Need to adjust the return values if no poisson solve
+            if self.args.no_poisson and len(pred_V) == len(faces):
+                ret['pred_V'] = pred_V.detach().reshape(-1, 2)
+
+                # Triangle soup
+                ret['ogT'] = ret['T'] # Save original triangle indices
+                ret['T'] = np.arange(len(faces)*3).reshape(len(faces), 3)
+
+                # Debugging: predicted fuvs make sense
+                if self.args.debug:
+                    import matplotlib.pyplot as plt
+                    fig, axs = plt.subplots(figsize=(6, 4))
+                    axs.triplot(ret['pred_V'][:,0].detach().cpu().numpy(), ret['pred_V'][:,1].detach().cpu().numpy(), ret['T'], linewidth=0.5)
+                    plt.axis('off')
+                    plt.savefig(f"scratch/{source.source_ind}_fuv_pred.png")
+                    plt.close(fig)
+                    plt.cla()
+
+            # if self.args.test:
+            #     ret['pred_J_R'] = poisson_J_restricted.detach()
+            #     ret['target_J_R'] = GT_J_restricted.detach()
 
         return ret
 
@@ -1881,18 +1496,15 @@ class MyNet(pl.LightningModule):
                 additional_parameters = [optweights]
                 optimizer.add_param_group({"params": additional_parameters, 'lr': self.lr})
 
-        # Add translation as additional parameter
-        # NOTE: With gradient stitching, we use L0 weighted least squares instead
-        if self.args.no_poisson and self.args.lossedgeseparation:
+        # Add texture optimization as additional parameter (from NUVO)
+        # Resolution: 256 x 256
+        if self.args.normalloss:
             self.trainer.fit_loop.setup_data()
             dataloader = self.trainer.train_dataloader
             for i, bundle in enumerate(dataloader):
                 source, target = bundle
-                faces = source.get_source_triangles()
-                init_translate = torch.ones(faces.shape[0], 1, 2).to(self.device).float() * 0.5
-                init_translate.requires_grad_()
-                additional_parameters = [init_translate]
-                optimizer.add_param_group({"params": additional_parameters, 'lr': self.lr}) # Direct optimization needs to be 100x larger
+                normalgrid = torch.zeros((3, 256, 256), dtype=torch.double, device=self.device, requires_grad=True)
+                optimizer.add_param_group({"params": [normalgrid], 'lr': self.lr})
 
         return {"optimizer": optimizer,
                 # "lr_scheduler": {
@@ -2025,7 +1637,7 @@ def main(gen, args):
                          logger=logger,
                          plugins=[SLURMEnvironment(requeue_signal=SIGUSR1)] if not args.debug else None,
                          accumulate_grad_batches=args.accumulate_grad_batches,
-                         num_sanity_val_steps=1,
+                         num_sanity_val_steps=-1,
                          enable_model_summary=False,
                          enable_progress_bar=True,
                          num_nodes=1,

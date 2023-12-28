@@ -178,31 +178,6 @@ class SourceMesh:
 
         self.poisson = self.mesh_processor.diff_ops.poisson_solver
 
-        ### Load ground truth UVs if set
-        if self.args.gtuvloss:
-            self.gt_uvs = torch.load(os.path.join(self.source_dir, "..", "..", "gt_uvs.pt"))
-            # Center the UVs
-            self.gt_uvs -= torch.mean(self.gt_uvs, dim=0, keepdim=True)
-            self.__loaded_data['gt_uvs'] = self.gt_uvs
-
-            # Debugging: plot the ground truth UVs!!
-            if self.args.debug:
-                from matplotlib.tri import Triangulation
-                import matplotlib.pyplot as plt
-
-                triangles = np.arange(len(self.gt_uvs)).reshape(-1, 3)
-                tris = Triangulation(self.gt_uvs[:, 0], self.gt_uvs[:, 1], triangles=triangles)
-                fig, axs = plt.subplots(figsize=(5, 5))
-                axs.set_title("Ground Truth UVs")
-                cmap = plt.get_cmap("tab20")
-                axs.tripcolor(tris, facecolors=np.ones(len(triangles)), cmap=cmap,
-                                    linewidth=0.1, edgecolor="black")
-                plt.axis('off')
-                axs.axis('equal')
-                plt.savefig("./scratch/gtuv.png")
-                plt.close(fig)
-                plt.cla()
-
         ## Precompute edge lengths and edgeidxs
         from source_njf.utils import get_edge_pairs, vertex_soup_correspondences, edge_soup_correspondences
         from itertools import combinations
@@ -214,6 +189,7 @@ class SourceMesh:
         ogfs = faces
         mesh = Mesh(vertices.detach().cpu().numpy(), faces)
 
+        # TODO: Refactor below such that there is a separate check for each cached item
         if os.path.exists(os.path.join(self.source_dir, "edge_vpairs.pt")) and \
             os.path.exists(os.path.join(self.source_dir, "facepairs_nobound.pt")) and \
             os.path.exists(os.path.join(self.source_dir, "elens_nobound.pt")) and \
@@ -356,6 +332,49 @@ class SourceMesh:
             else:
                 raise NotImplementedError(f"Soft poisson weight {self.args.spweight} not implemented!")
 
+        ### Load ground truth UVs if set
+        if self.args.gtuvloss:
+            self.gt_uvs = torch.load(os.path.join(self.source_dir, "..", "..", "gt_uvs.pt"))
+            # Center the UVs
+            self.gt_uvs -= torch.mean(self.gt_uvs, dim=0, keepdim=True)
+            self.__loaded_data['gt_uvs'] = self.gt_uvs
+
+            # Plot GT UVs (for visualization)
+            from matplotlib.tri import Triangulation
+            import matplotlib.pyplot as plt
+
+            triangles = np.arange(len(self.gt_uvs)).reshape(-1, 3)
+            tris = Triangulation(self.gt_uvs[:, 0], self.gt_uvs[:, 1], triangles=triangles)
+            fig, axs = plt.subplots(figsize=(5, 5))
+            axs.set_title("Ground Truth UVs")
+            cmap = plt.get_cmap("tab20")
+            axs.tripcolor(tris, facecolors=np.ones(len(triangles)), cmap=cmap,
+                                linewidth=0.1, edgecolor="black")
+            plt.axis('off')
+            axs.axis('equal')
+            plt.savefig(os.path.join(self.source_dir, "..", "..", "gtuv.png"))
+            plt.close(fig)
+            plt.cla()
+
+            # Also plot GT cuts
+            if os.path.exists(os.path.join(self.source_dir, "..", "..", "gt_cutvpairs.pkl")):
+                import dill as pickle
+
+                with open(os.path.join(self.source_dir, "..", "..", "gt_cutvpairs.pkl"), 'rb') as f:
+                    self.gt_cutvpairs = pickle.load(f)
+
+                from results_saving_scripts.plot_uv import export_views
+                cutvs = [list(vpair) for vpair in self.gt_cutvpairs]
+                cylinderpos = ogvs[cutvs]
+                cylindervals = np.ones((len(cylinderpos), 2)) # E x 2
+                export_views(ogvs, ogfs, os.path.join(self.source_dir, "..", ".."),
+                            filename=f"gtcuts.png",
+                                plotname=f"Ground Truth Cuts", cylinders=cylinderpos,
+                                cylinder_scalars=cylindervals,
+                                outline_width=0.01, cmap = plt.get_cmap('Reds_r'),
+                                device="cpu", n_sample=30, width=200, height=200,
+                                vmin=0, vmax=1, shading=False)
+
         ### Load ground truth jacobians + weights if set
         if self.args.gtnetworkloss:
             self.gt_jacobians = torch.load(os.path.join(self.source_dir, "..", "..", "gt_j.pt"))
@@ -365,12 +384,53 @@ class SourceMesh:
                 self.gt_cutvpairs = pickle.load(f)
 
             # NOTE: network output is ordered by edge indexing
-            # TODO: map vpairs to edge indexes (vpair_to_meshe)
             self.gt_weights = torch.ones(len(self.edge_vpairs), device=device).double()
+
+            # NOTE: sometimes we accidentally saved cut vpair indices that are on boundary of original mesh -- oops
             cut_es = [self.meshe_to_meshenobound[self.vpair_to_meshe[frozenset(vpair)]] for vpair in self.gt_cutvpairs if self.vpair_to_meshe[frozenset(vpair)] in self.meshe_to_meshenobound.keys()]
             self.gt_weights[cut_es] = 0
             self.__loaded_data['gt_weights'] = self.gt_weights
             self.__loaded_data['gt_jacobians'] = self.gt_jacobians
+
+            # Plot GT UVs
+            from matplotlib.tri import Triangulation
+            import matplotlib.pyplot as plt
+            if os.path.exists(os.path.join(self.source_dir, "..", "..", "gt_uvs.pt")):
+                # Also load the gt uvs (for visualization)
+                self.gt_uvs = torch.load(os.path.join(self.source_dir, "..", "..", "gt_uvs.pt"))
+                # Center the UVs
+                self.gt_uvs -= torch.mean(self.gt_uvs, dim=0, keepdim=True)
+
+                # Plot GT UVs (for visualization)
+                from matplotlib.tri import Triangulation
+                import matplotlib.pyplot as plt
+
+                triangles = np.arange(len(self.gt_uvs)).reshape(-1, 3)
+                tris = Triangulation(self.gt_uvs[:, 0], self.gt_uvs[:, 1], triangles=triangles)
+                fig, axs = plt.subplots(figsize=(5, 5))
+                axs.set_title("Ground Truth UVs")
+                cmap = plt.get_cmap("tab20")
+                axs.tripcolor(tris, facecolors=np.ones(len(triangles)), cmap=cmap,
+                                    linewidth=0.1, edgecolor="black")
+                plt.axis('off')
+                axs.axis('equal')
+                plt.savefig(os.path.join(self.source_dir, "..", "..", "gtuv.png"))
+                plt.close(fig)
+                plt.cla()
+
+            # Also plot GT cuts
+            from results_saving_scripts.plot_uv import export_views
+
+            cutvs = [list(vpair) for vpair in self.gt_cutvpairs]
+            cylinderpos = ogvs[cutvs]
+            cylindervals = np.ones((len(cylinderpos), 2)) # E x 2
+            export_views(ogvs, ogfs, os.path.join(self.source_dir, "..", ".."),
+                         filename=f"gtcuts.png",
+                            plotname=f"Ground Truth Cuts", cylinders=cylinderpos,
+                            cylinder_scalars=cylindervals,
+                            outline_width=0.01, cmap = plt.get_cmap('Reds_r'),
+                            device="cpu", n_sample=30, width=200, height=200,
+                            vmin=0, vmax=1, shading=False)
 
         self.__loaded_data['valid_edge_pairs'] = self.valid_edge_pairs
         self.__loaded_data['facepairs'] = self.facepairs
@@ -378,6 +438,13 @@ class SourceMesh:
         self.__loaded_data['elens_nobound'] = self.elens_nobound
         self.__loaded_data['ogedge_vpairs_nobound'] = self.ogedge_vpairs_nobound
         self.__loaded_data['facepairs_nobound'] = self.facepairs_nobound
+
+        # Compute normals if normal loss
+        if self.args.normalloss:
+            from meshing.analysis import computeFaceNormals
+            computeFaceNormals(mesh)
+            self.fnormals = torch.from_numpy(mesh.fnormals).to(device)
+            self.__loaded_data['fnormals'] = self.fnormals
 
         ### Initialize embeddings ###
         # keepidxs determines which edges to compute the loss over
@@ -389,7 +456,6 @@ class SourceMesh:
                 os.path.exists(os.path.join(self.source_dir, "tutteuv.pt")) and \
                 os.path.exists(os.path.join(self.source_dir, "tuttej.pt")) and \
                 os.path.exists(os.path.join(self.source_dir, "tuttetranslate.pt")) and \
-                os.path.exists(os.path.join(self.source_dir, f"tutteinitweights_{self.args.softpoisson}.pt")) and \
                 os.path.exists(os.path.join(self.source_dir, "cutvs.npy")) and \
                 os.path.exists(os.path.join(self.source_dir, "cutfs.npy")) and \
                     not new_init and self.args.ignorei == 0:
@@ -397,9 +463,11 @@ class SourceMesh:
                 self.tutteuv = torch.load(os.path.join(self.source_dir, "tutteuv.pt"))
                 self.tuttej = torch.load(os.path.join(self.source_dir, "tuttej.pt"))
                 self.tuttetranslate = torch.load(os.path.join(self.source_dir, "tuttetranslate.pt"))
-                self.initweights = torch.load(os.path.join(self.source_dir, f"tutteinitweights_{self.args.softpoisson}.pt"))
                 self.cutvs = np.load(os.path.join(self.source_dir, "cutvs.npy"))
                 self.cutfs = np.load(os.path.join(self.source_dir, "cutfs.npy"))
+
+                if self.args.softpoisson:
+                    self.initweights = torch.load(os.path.join(self.source_dir, f"tutteinitweights_{self.args.softpoisson}.pt"))
 
                 # Get delete idxs and remove from keepidxs
                 if self.args.removecutfromloss:
@@ -504,34 +572,48 @@ class SourceMesh:
                         self.cutfs = faces
                     ### Set initialization weights here based on the cuts (mark cut edge weights to 0)
                     else:
-                        # DEBUGGING: Check the laplacian in self.poisson (indexed by edge_vpairs)
-                        # TODO: all indexes should be 0 in the soft poisson laplacian
-                        ogmesh = Mesh(ogvs, ogfs)
-                        cutvedges = [frozenset([cutvs[i], cutvs[i+1]]) for i in range(len(cutvs)-1)]
-                        deleteidxs = []
-                        for cutvpair in cutvedges:
-                            eidx = self.vpair_to_meshe[cutvpair]
-                            eidx_nobound = self.meshe_to_meshenobound[eidx]
-                            deleteidxs.append(eidx_nobound)
-                            # Debug: cutvpair should equal the vertex pair corresponding to eidx
-                            # checke = frozenset([v.index for v in ogmesh.topology.edges[eidx].two_vertices()])
-                            # assert checke == cutvpair, f"Cut vertex pair {cutvpair} does not match edge vpair {checke}!"
-                            # assert eidx in ignoreset, f"Cut edge {eidx} not in ignoreset {ignoreset}!"
+                        if self.args.softpoisson:
+                            # DEBUGGING: Check the laplacian in self.poisson (indexed by edge_vpairs)
+                            # TODO: all indexes should be 0 in the soft poisson laplacian
+                            ogmesh = Mesh(ogvs, ogfs)
+                            cutvedges = [frozenset([cutvs[i], cutvs[i+1]]) for i in range(len(cutvs)-1)]
+                            deleteidxs = []
+                            for cutvpair in cutvedges:
+                                eidx = self.vpair_to_meshe[cutvpair]
+                                eidx_nobound = self.meshe_to_meshenobound[eidx]
+                                deleteidxs.append(eidx_nobound)
+                                # Debug: cutvpair should equal the vertex pair corresponding to eidx
+                                # checke = frozenset([v.index for v in ogmesh.topology.edges[eidx].two_vertices()])
+                                # assert checke == cutvpair, f"Cut vertex pair {cutvpair} does not match edge vpair {checke}!"
+                                # assert eidx in ignoreset, f"Cut edge {eidx} not in ignoreset {ignoreset}!"
 
-                            if self.args.spweight == "sigmoid":
-                                self.initweights[eidx_nobound] = -10
-                            elif self.args.spweight == ["softmax", "nonzero"]:
-                                self.initweights[eidx_nobound] = 0
-                            elif self.args.spweight in ["seamless", "cosine"]:
-                                self.initweights[eidx_nobound] = -0.5
+                                if self.args.spweight == "sigmoid":
+                                    self.initweights[eidx_nobound] = -10
+                                elif self.args.spweight == ["softmax", "nonzero"]:
+                                    self.initweights[eidx_nobound] = 0
+                                elif self.args.spweight in ["seamless", "cosine"]:
+                                    self.initweights[eidx_nobound] = -0.5
 
                         if self.args.removecutfromloss:
                             self.keepidxs = np.delete(self.keepidxs, deleteidxs)
+
+                        # Plot init cuts
+                        from results_saving_scripts.plot_uv import export_views
+                        cutvedges = [list(vpair) for vpair in cutvedges]
+                        cylinderpos = ogvs[cutvedges]
+                        cylindervals = np.ones((len(cylinderpos), 2)) # E x 2
+                        export_views(ogvs, ogfs, os.path.join(self.source_dir, "..", ".."),
+                                    filename=f"initcuts.png",
+                                        plotname=f"Initial Cuts", cylinders=cylinderpos,
+                                        cylinder_scalars=cylindervals,
+                                        outline_width=0.01, cmap = plt.get_cmap('Reds_r'),
+                                        device="cpu", n_sample=30, width=200, height=200,
+                                        vmin=0, vmax=1, shading=False)
                 else:
                     self.tutteuv = torch.from_numpy(tutte_embedding(vertices.detach().cpu().numpy(), faces)).unsqueeze(0) # 1 x V x 2
 
                     # Get Jacobians
-                    souptutte = self.tutteuv.squeeze()[:,:2][self.cutfs].reshape(-1, 2)
+                    souptutte = self.tutteuv.squeeze()[:,:2][self.cutfs, :].reshape(-1, 2)
                     soupvs = torch.from_numpy(ogsoup.reshape(-1, 3))
                     soupfs = torch.arange(len(soupvs)).reshape(-1, 3)
                     self.tuttej = get_jacobian_torch(soupvs, soupfs, souptutte, device=device) # F x 2 x 3
@@ -569,7 +651,9 @@ class SourceMesh:
                     torch.save(self.tutteuv, os.path.join(self.source_dir, "tutteuv.pt"))
                     torch.save(self.tuttej, os.path.join(self.source_dir, "tuttej.pt"))
                     torch.save(self.tuttetranslate, os.path.join(self.source_dir, "tuttetranslate.pt"))
-                    torch.save(self.initweights, os.path.join(self.source_dir, f"tutteinitweights_{self.args.softpoisson}.pt"))
+
+                    if self.args.softpoisson:
+                        torch.save(self.initweights, os.path.join(self.source_dir, f"tutteinitweights_{self.args.softpoisson}.pt"))
 
                     np.save(os.path.join(self.source_dir, f"cutvs.npy"), self.cutvs)
                     np.save(os.path.join(self.source_dir, f"cutfs.npy"), self.cutfs)
@@ -580,7 +664,9 @@ class SourceMesh:
             self.__loaded_data['tutteuv'] = self.tutteuv
             self.__loaded_data['tuttej'] = self.tuttej
             self.__loaded_data['tuttetranslate'] = self.tuttetranslate
-            self.__loaded_data['initweights'] = self.initweights
+
+            if self.args.softpoisson:
+                self.__loaded_data['initweights'] = self.initweights
 
             if self.initjinput:
                 # NOTE: If vertex features, then just use the initial UV position
@@ -615,18 +701,6 @@ class SourceMesh:
                 else:
                     self.input_features = torch.cat([self.input_features, torch.stack([self.initweights] * self.input_features.shape[0], dim=0).to(self.input_features.device)], dim=1)
 
-            # self.__loaded_data['localj'] = self.localj
-
-            # Debugging: plot the initial embedding
-            # import matplotlib.pyplot as plt
-            # fig, axs = plt.subplots(figsize=(6, 4))
-            # # plot ours
-            # axs.triplot(self.tutteuv[0,:,0], self.tutteuv[0,:,1], self.get_source_triangles(), linewidth=0.5)
-            # plt.axis('off')
-            # plt.savefig(f"scratch/{self.source_ind}.png")
-            # plt.close(fig)
-            # plt.cla()
-
         elif self.init == "precut":
             if os.path.exists(os.path.join(self.source_dir, "prefuv.pt")) and \
                 os.path.exists(os.path.join(self.source_dir, "preuv.pt")) and \
@@ -642,6 +716,21 @@ class SourceMesh:
                 if self.args.removecutfromloss:
                     deleteidxs = np.where(self.initweights < 0)[0]
                     self.keepidxs = np.delete(self.keepidxs, deleteidxs)
+
+                # Plot init cuts if haven't yet
+                if not os.path.exists(os.path.join(self.source_dir, "..", "..", "initcuts.png")):
+                    initcuts = pickle.load(open(os.path.join(self.source_dir, "..", "..", "initialcuts.pkl"), "rb"))
+                    from results_saving_scripts.plot_uv import export_views
+                    initcuts = [list(cut) for cut in initcuts]
+                    cylinderpos = ogvs[initcuts]
+                    cylindervals = np.ones((len(cylinderpos), 2)) # E x 2
+                    export_views(ogvs, ogfs, os.path.join(self.source_dir, "..", ".."),
+                                filename=f"initcuts.png",
+                                    plotname=f"Initial Cuts", cylinders=cylinderpos,
+                                    cylinder_scalars=cylindervals,
+                                    outline_width=0.01, cmap = plt.get_cmap('Reds_r'),
+                                    device="cpu", n_sample=30, width=200, height=200,
+                                    vmin=0, vmax=1, shading=False)
             else:
                 from utils import get_local_tris
 
@@ -691,6 +780,19 @@ class SourceMesh:
                 if self.args.removecutfromloss:
                     self.keepidxs = np.delete(self.keepidxs, deleteidxs)
 
+                # Plot init cuts
+                from results_saving_scripts.plot_uv import export_views
+                initcuts = [list(cut) for cut in initcuts]
+                cylinderpos = ogvs[initcuts]
+                cylindervals = np.ones((len(cylinderpos), 2)) # E x 2
+                export_views(ogvs, ogfs, os.path.join(self.source_dir, "..", ".."),
+                            filename=f"initcuts.png",
+                                plotname=f"Initial Cuts", cylinders=cylinderpos,
+                                cylinder_scalars=cylindervals,
+                                outline_width=0.01, cmap = plt.get_cmap('Reds_r'),
+                                device="cpu", n_sample=30, width=200, height=200,
+                                vmin=0, vmax=1, shading=False)
+
                 # Unit Test: jacobians recover pre uvs
                 fverts = vertices[faces]
                 pred_V = torch.einsum("abc,acd->abd", (fverts, self.prej[:,:2,:].transpose(2,1)))
@@ -713,7 +815,9 @@ class SourceMesh:
             self.__loaded_data['prefuv'] = self.prefuv
             self.__loaded_data['preuv'] = self.preuv
             self.__loaded_data['prej'] = self.prej
-            self.__loaded_data['initweights'] = self.initweights
+
+            if self.args.softpoisson:
+                self.__loaded_data['initweights'] = self.initweights
 
             if self.initjinput:
                 if self.args.arch == "diffusionnet":
@@ -853,6 +957,19 @@ class SourceMesh:
 
                         if self.args.removecutfromloss:
                             self.keepidxs = np.delete(self.keepidxs, deleteidxs)
+
+                        # Plot init cuts
+                        from results_saving_scripts.plot_uv import export_views
+                        cutvedges = [list(vpair) for vpair in cutvedges]
+                        cylinderpos = ogvs[cutvedges]
+                        cylindervals = np.ones((len(cylinderpos), 2)) # E x 2
+                        export_views(ogvs, ogfs, os.path.join(self.source_dir, "..", ".."),
+                                    filename=f"initcuts.png",
+                                        plotname=f"Initial Cuts", cylinders=cylinderpos,
+                                        cylinder_scalars=cylindervals,
+                                        outline_width=0.01, cmap = plt.get_cmap('Reds_r'),
+                                        device="cpu", n_sample=30, width=200, height=200,
+                                        vmin=0, vmax=1, shading=False)
                 else:
                     self.slimuv = torch.from_numpy(SLIM(ogmesh, iters=self.args.slimiters)[0]).unsqueeze(0) # 1 x V x 2
 
@@ -904,7 +1021,9 @@ class SourceMesh:
             self.__loaded_data['slimuv'] = self.slimuv
             self.__loaded_data['slimj'] = self.slimj
             self.__loaded_data['slimtranslate'] = self.slimtranslate
-            self.__loaded_data['initweights'] = self.initweights
+
+            if self.args.softpoisson:
+                self.__loaded_data['initweights'] = self.initweights
 
             if self.initjinput:
                 if self.args.arch == "diffusionnet":

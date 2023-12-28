@@ -114,9 +114,6 @@ elif args.init == "obj":
     inituv = inituv[faces].reshape(-1, 2)
 
 # Normalize and center the uvs
-from source_njf.utils import normalize_uv
-normalize_uv(inituv)
-
 objname = os.path.basename(datadir).split(".")[0]
 if args.savename is None:
     screendir = os.path.join(savedir, objname)
@@ -210,9 +207,20 @@ plot_uv(screendir, f"inituv", inituv.detach().cpu().numpy(),  faces.detach().cpu
 for iteration in range(starti, args.niters):
     loss = 0
 
+    # Face UVs
+    uv_face = inituv.reshape(-1, 3, 2) # F x 3 x 2
+
+    # Center the UVs at origin
+    from source_njf.utils import normalize_uv
+    with torch.no_grad():
+        normalize_uv(uv_face)
+
     # Rotate using rotmatrix
     rotmatrix = torch.cat([torch.cos(theta), -torch.sin(theta), torch.sin(theta), torch.cos(theta)]).reshape(2, 2)
-    uvs = inituv @ rotmatrix
+    uv_face = uv_face @ rotmatrix
+
+    # Scale back to centered at 0.5
+    uv_face += 0.5
 
     # SDS loss
     # Prereqs: texture image, texture description
@@ -246,14 +254,6 @@ for iteration in range(starti, args.niters):
         azim = torch.linspace(center[0], 2 * np.pi + center[0], num_views + 1)[
             :-1].double().to(device)
         elev = torch.zeros(len(azim), device=device).double()
-
-        # Face UVs
-        uv_face = uvs.reshape(-1, 3, 2) # F x 3 x 2
-
-        # Need to scale UVs between 0-1
-        from source_njf.utils import normalize_uv
-        with torch.no_grad():
-            normalize_uv(uv_face)
 
         rgb_images.append(render_texture(vertices.double(), faces, uv_face, elev, azim, radius, textureimg/255, lights=None,
                                                 resolution=(args.resolution, args.resolution), device=device, lookatheight=0, whitebg=True,
@@ -298,7 +298,11 @@ for iteration in range(starti, args.niters):
     if args.imageloss:
         from PIL import Image
         from torchvision.transforms.functional import pil_to_tensor
-        textureimg = pil_to_tensor(Image.open(args.textureimg)).double().to(device)
+        texturename = os.path.basename(args.textureimg).split(".")[0]
+        img = Image.open(args.textureimg)
+        img = img.convert("RGB")
+        textureimg = pil_to_tensor(img).double().to(device)
+
         rgb_images = []
 
         from source_njf.renderer import render_texture
@@ -311,11 +315,8 @@ for iteration in range(starti, args.niters):
         elev = torch.zeros(len(azim), device=device).double()
 
         # Subset to the number of views input
-        azim = azim[[3]]
-        elev = elev[[3]]
-
-        # Face UVs
-        uv_face = uvs.reshape(-1, 3, 2) # F x 3 x 2
+        # azim = azim[[3]]
+        # elev = elev[[3]]
 
         pred_images = render_texture(vertices.double(), faces, uv_face, elev, azim, radius, textureimg/255, lights=None,
                                                 resolution=(args.resolution, args.resolution), device=device, lookatheight=0, whitebg=True,
@@ -325,15 +326,14 @@ for iteration in range(starti, args.niters):
         gt_images = []
 
         # HACK: we only look at the 3rd render for flat triangle
-        # for i in range(num_views):
-        #     gt_image = torchvision.io.read_image(args.imageloss + f"_{i}.png").double().to(device)
-        #     gt_image = Resize((args.resolution, args.resolution))(gt_image)/255
-        #     gt_images.append(gt_image)
+        for i in range(num_views):
+            gt_image = torchvision.io.read_image(args.imageloss + f"_{i}.png").double().to(device)
+            gt_image = Resize((args.resolution, args.resolution))(gt_image)/255
+            gt_images.append(gt_image)
+        # gt_image = torchvision.io.read_image(args.imageloss + f"_3.png").double().to(device)
+        # gt_image = Resize((args.resolution, args.resolution))(gt_image)/255
+        # gt_images.append(gt_image)
 
-
-        gt_image = torchvision.io.read_image(args.imageloss + f"_3.png").double().to(device)
-        gt_image = Resize((args.resolution, args.resolution))(gt_image)/255
-        gt_images.append(gt_image)
         gt_images = torch.stack(gt_images, dim=0)
         imageloss = torch.nn.functional.mse_loss(rgb_images[0]['image'], gt_images, reduction="none")
         loss += torch.mean(imageloss)
@@ -384,7 +384,7 @@ for iteration in range(starti, args.niters):
             if key in lossdict_convert:
                 lossdict_viz[lossdict_convert[key]] = item[-1]
 
-        plot_uv(framedir, f"uv_{iteration:06}", uvs.detach().cpu().numpy(), soupfs.detach().cpu().numpy(),
+        plot_uv(framedir, f"uv_{iteration:06}", uv_face.reshape(-1, 2).detach().cpu().numpy(), soupfs.detach().cpu().numpy(),
                 losses=lossdict_viz,
                 facecolors = np.arange(len(soupfs))/(len(soupfs)-1))
 
@@ -419,7 +419,7 @@ for iteration in range(starti, args.niters):
             plt.cla()
 
             # Log the plotted imgs
-            images = [wandb.Image(Image.open(os.path.join(framedir, f"texture_{iteration:06}.png"))), wandb.Image(Image.open(args.imageloss + f"_3.png"))]
+            images = [wandb.Image(Image.open(os.path.join(framedir, f"texture_{iteration:06}.png"))), wandb.Image(Image.open(args.imageloss + f".png"))]
             wandb.log({'textures': images}, commit=True)
 
         # Plot the image loss image
@@ -474,16 +474,16 @@ for iteration in range(starti, args.niters):
 #     plt.cla()
 
 # Save final UVs, weights, and jacobians
-np.save(os.path.join(screendir, "uv.npy"), uvs.detach().cpu().numpy())
+np.save(os.path.join(screendir, "uv.npy"), uv_face.reshape(-1, 2).detach().cpu().numpy())
 np.save(os.path.join(screendir, "theta.npy"), theta.detach().cpu().numpy())
 
 # Show flipped triangles
 from source_njf.utils import get_flipped_triangles
-flipped = get_flipped_triangles(uvs.detach().cpu().numpy(), soupfs.detach().cpu().numpy())
+flipped = get_flipped_triangles(uv_face.reshape(-1, 2).detach().cpu().numpy(), soupfs.detach().cpu().numpy())
 flipvals = np.zeros(len(soupfs))
 flipvals[flipped] = 1
 lossdict = {'fliploss': flipvals}
 
-plot_uv(screendir, f"finaluv", uvs.detach().cpu().numpy(), soupfs.detach().cpu().numpy(),
+plot_uv(screendir, f"finaluv", uv_face.reshape(-1, 2).detach().cpu().numpy(), soupfs.detach().cpu().numpy(),
                     facecolors = np.arange(len(soupfs))/(len(soupfs)-1),
                     losses=lossdict)
