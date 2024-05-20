@@ -58,6 +58,10 @@ class MyNet(pl.LightningModule):
         self.args = args
         self.arch = self.args.arch
 
+        # HACK: singlescaling
+        if not hasattr(args, "singlescaling"):
+            args.singlescaling = False
+
         # HACK: normalize init
         if not hasattr(args, "normalizeinit"):
             args.normalizeinit = False

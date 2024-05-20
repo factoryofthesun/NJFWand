@@ -145,6 +145,8 @@ def get_arg_parser():
 	parser.add_argument("--precision",help ="the precision we work in, should be 16,32,or 64 (default)",default=64,type=int)
 	parser.add_argument("--vertex_loss_weight", help="the weight to place on the vertex loss (jacobian loss is unweighted) default = 1.0", default=1.0, type=float)
 
+	parser.add_argument("--singlescaling", help='optimize single scaling parameter per embedding', action="store_true")
+
  	###### POSTPROCESS ######
 	parser.add_argument("--hardpoisson", type=str, choices={'uv', 'weight', 'jacobians'}, help = "cutting options for hard poisson",
 						default=None)
