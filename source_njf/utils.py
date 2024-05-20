@@ -16,10 +16,10 @@ def clear_directory(path):
             print('Failed to delete %s. Reason: %s' % (file_path, e))
 
 # Normalize UVs (inplace so no_grad works)
-def normalize_uvs(uv):
+def normalize_uv(uv):
     uv -= torch.mean(uv, dim=0)
-    uv /= (2 * torch.max(torch.linalg.norm(uv, dim=1)))
-    uv += torch.tensor([0.5, 0.5], device=uv.device)
+    uv /= torch.max(torch.linalg.norm(uv, dim=1))
+    # uv += torch.tensor([0.5, 0.5], device=uv.device)
 
 # Generate cutset (list of vertex frozenset pairs) from soup UVs
 # NOTE: We assume vertex order has not changed within face arrays

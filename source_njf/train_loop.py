@@ -1752,6 +1752,16 @@ class MyNet(pl.LightningModule):
             elev = ((torch.rand(self.args.nviews) - 0.5) * 2 * 0.5 * np.pi/4).float().to(self.device)
             azim = (torch.rand(self.args.nviews) * 2 * np.pi).float().to(self.device)
 
+            if self.args.singlescaling:
+                from source_njf.utils import normalize_uv
+                scale = self.trainer.optimizers[0].param_groups[1]['params'][0]
+
+                # Normalize UVs
+                with torch.no_grad():
+                    normalize_uv(pred_V)
+
+                pred_V = pred_V * scale
+
             for texturename in source.texturenames:
                 if texturename not in self.textureimg:
                     continue
@@ -2288,8 +2298,18 @@ class MyNet(pl.LightningModule):
                 source, target = bundle
                 initweights = source.initweights
                 optweights = torch.zeros(initweights.shape).to(self.device).double() + 1e-7
-                optweights.requires_glrad_()
+                optweights.requires_grad_()
                 additional_parameters = [optweights]
+                optimizer.add_param_group({"params": additional_parameters, 'lr': self.lr})
+
+        # Add scaling parameter
+        if self.args.singlescaling:
+            self.trainer.fit_loop.setup_data()
+            dataloader = self.trainer.train_dataloader
+            for i, bundle in enumerate(dataloader):
+                source, target = bundle
+                scaling = torch.ones(1).to(self.device).double() * 0.5
+                additional_parameters = [scaling]
                 optimizer.add_param_group({"params": additional_parameters, 'lr': self.lr})
 
         # Add texture optimization as additional parameter (from NUVO)
