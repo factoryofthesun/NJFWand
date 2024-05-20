@@ -50,7 +50,6 @@ if USE_SCIPY:
 if USE_TORCH_SPARSE:
     import torch_sparse
 
-
 USE_UGLY_PATCH_FOR_CUPY_ERROR = False
 
 
@@ -104,12 +103,13 @@ class SparseMat:
                 densemat = torch.cat([densemat[:pidx, :], torch.from_numpy(lap_pinned_rows[i]).type_as(densemat).to(self.vals.device), densemat[pidx:,:]], dim=0)
                 densemat = torch.cat([densemat[:, :pidx], torch.from_numpy(lap_pinned_cols[i]).type_as(densemat).to(self.vals.device), densemat[:,pidx:]], dim=1)
 
+        # NOTE: Technically should be laplace + new_vals, but new_vals only ever indexes OG edges which are 0 in soft laplace anyway
         densemat[target_inds] = new_vals
         # densemat[target_inds[1], target_inds[0]] = new_vals
 
         densemat.fill_diagonal_(0)
-        densemat[range(len(densemat)), range(len(densemat))] = -torch.sum(densemat, dim=1)
-        torch.testing.assert_close(torch.sum(densemat, dim=1), torch.zeros(densemat.shape[0], device=densemat.device, dtype=densemat.dtype), atol=1e-4, rtol=1e-4)
+        densemat[range(len(densemat)), range(len(densemat))] = -torch.sum(densemat, dim=1).detach()
+        torch.testing.assert_close(torch.zeros(densemat.shape[0], device=densemat.device, dtype=densemat.dtype), torch.sum(densemat, dim=1), atol=1e-4, rtol=1e-4)
 
         if lap_pinned is not None:
             for pidx in lap_pinned:
@@ -393,13 +393,14 @@ class PoissonSolver:
                     # assert self.my_splu_dense.requires_grad, f"dense weighted laplacian should require grad"
         elif self.my_splu is None:
             self.my_splu = self.lap.to_cholesky()
+            self.my_splu_dense = torch.sparse_coo_tensor(self.lap.inds, self.lap.vals, (self.lap.n, self.lap.m)).to_dense()
 
         # NOTE: Jacobians go from (B x F x 3 x 3) => (B x F*3 x 3) with last two dimensions swapped (restriction dimension goes to last column)
         if self.soft:
             sol =  _predicted_jacobians_to_vertices_via_soft_poisson_solve(self.my_splu, self.my_splu_dense, self.sparse_rhs, jacobians.transpose(2, 3).reshape(jacobians.shape[0], -1, 3, 1).squeeze(3).contiguous(),
                                                                            sparse = self.sparse)
         else:
-            sol = _predicted_jacobians_to_vertices_via_poisson_solve(self.my_splu, self.sparse_rhs, jacobians.transpose(2, 3).reshape(jacobians.shape[0], -1, 3, 1).squeeze(3).contiguous())
+            sol = _predicted_jacobians_to_vertices_via_poisson_solve(self.my_splu, self.my_splu_dense, self.sparse_rhs, jacobians.transpose(2, 3).reshape(jacobians.shape[0], -1, 3, 1).squeeze(3).contiguous())
 
         if self.lap_pinned is not None:
             # NOTE: All component groups get pinned to origin
@@ -420,10 +421,10 @@ class PoissonSolver:
 
         # torch.cuda.synchronize()
         # print(f"POISSON LU + SOLVE FORWARD{time.time() - st}")
-        c = torch.mean(sol, axis=1, keepdim=True)
+        # c = torch.mean(sol, axis=1, keepdim=True)
 
         # print(f"time for poisson: {time.time() - st}" )
-        return sol - c
+        return sol
 
     def pin_memory(self):
         return
@@ -447,6 +448,7 @@ def poisson_system_matrices_from_mesh( V,F, dim=3,ttype = torch.float64, is_spar
     assert type(is_sparse) == bool
 
     # Softpoisson mode: poisson matrix is triangle soup
+    V = V.astype(np.float64)
     if softpoisson:
         fverts = V[F]
         vertices = fverts.reshape(-1, dim)
@@ -475,8 +477,8 @@ def poisson_system_matrices_from_mesh( V,F, dim=3,ttype = torch.float64, is_spar
     np.testing.assert_allclose(np.sum(laplace, axis=1), 0, atol=1e-4)
 
     # For soft poisson, we assume the surface is connected
-    lap_pinned_rows = None
-    lap_pinned_cols = None
+    lap_pinned_rows = []
+    lap_pinned_cols = []
     if softpoisson:
         lap_pinned = np.array([0])
 
@@ -493,6 +495,9 @@ def poisson_system_matrices_from_mesh( V,F, dim=3,ttype = torch.float64, is_spar
             cp_idx = np.where(components == i)[0][0]
             lap_pinned.append(cp_idx)
         lap_pinned = np.array(lap_pinned)
+        colselect = [i for i in range(len(laplace)) if i not in lap_pinned]
+        lap_pinned_rows = laplace[lap_pinned.reshape(-1, 1), [colselect]]
+        lap_pinned_cols = laplace[:, lap_pinned]
         laplace = np.delete(np.delete(laplace, lap_pinned, axis=0), lap_pinned, axis=1) # Remove row and column
 
     # Convert back to sparse matrix
@@ -542,9 +547,6 @@ def _get_mass_matrix(vertices,faces,is_sparse):
     if is_sparse:
         return sp_csc(diags(d_area))
     return diags(d_area)
-
-
-
 
 class SPLUSolveLayer(torch.autograd.Function):
     '''
@@ -831,7 +833,7 @@ def _predicted_jacobians_to_vertices_via_soft_poisson_solve(softlap_sparse, soft
 
     return out.type_as(jacobians)
 
-def _predicted_jacobians_to_vertices_via_poisson_solve(Lap, rhs, jacobians):
+def _predicted_jacobians_to_vertices_via_poisson_solve(Lap, lap_dense, rhs, jacobians):
     '''
     convert the predictions to the correct convention and feed it to the poisson solve
     '''
@@ -875,10 +877,13 @@ def _predicted_jacobians_to_vertices_via_poisson_solve(Lap, rhs, jacobians):
     P = P.double()
     input_to_solve = _multiply_sparse_2d_by_dense_3d(rhs, P)
 
+    # Run standard torch linalg solve
+    out = torch.linalg.solve(lap_dense, input_to_solve) # B x V x 2
+
     # NOTE: Use different solve layer that takes as input the sparsemat values directly and constructs
     #       the Lap splu solver from there => need to pass gradients back using product rule to both
     #       the soft Laplacian AND the jacobians
-    out = SPLUSolveLayer.apply(Lap, input_to_solve) # B x V x 2
+    # out = SPLUSolveLayer.apply(Lap, input_to_solve) # B x V x 2
 
     return out.type_as(jacobians)
 

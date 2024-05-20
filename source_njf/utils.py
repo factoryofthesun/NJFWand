@@ -2,6 +2,7 @@ import os
 import shutil
 import numpy as np
 import torch
+import time
 
 def clear_directory(path):
     for filename in os.listdir(path):
@@ -14,11 +15,59 @@ def clear_directory(path):
         except Exception as e:
             print('Failed to delete %s. Reason: %s' % (file_path, e))
 
+# Normalize UVs (inplace so no_grad works)
+def normalize_uvs(uv):
+    uv -= torch.mean(uv, dim=0)
+    uv /= (2 * torch.max(torch.linalg.norm(uv, dim=1)))
+    uv += torch.tensor([0.5, 0.5], device=uv.device)
+
+# Generate cutset (list of vertex frozenset pairs) from soup UVs
+# NOTE: We assume vertex order has not changed within face arrays
+def cuts_from_uv(mesh, uvmesh):
+    meshetovpair = {} # edge idx (mesh indexing) => (v1, v2)
+    for eidx, edge in sorted(mesh.topology.edges.items()):
+        v1, v2 = edge.two_vertices()
+        meshetovpair[frozenset([v1.index, v2.index])] = eidx
+
+    og_cutpairs = []
+    for boundary in mesh.topology.boundaries.values():
+        cutvs = [v.index for v in boundary.adjacentVertices()]
+        cutpairs = [frozenset([cutvs[i], cutvs[i+1]]) for i in range(len(cutvs)-1)] + [frozenset([cutvs[-1], cutvs[0]])]
+        og_cutpairs.extend(cutpairs)
+
+    fuv_idxs = uvmesh.faces
+    fuv_to_v = np.zeros(np.max(fuv_idxs) + 1).astype(int)
+    fuv_to_v[fuv_idxs.flatten()] = mesh.faces.flatten()
+
+    cut_vpairs = []
+    for boundary in uvmesh.topology.boundaries.values():
+        cutvs = [v.index for v in boundary.adjacentVertices()]
+        cutpairs = [frozenset([fuv_to_v[cutvs[i]], fuv_to_v[cutvs[i+1]]]) for i in range(len(cutvs)-1)] + [frozenset([fuv_to_v[cutvs[-1]], fuv_to_v[cutvs[0]]])]
+
+        # NOTE: We remove edges that already existed on boundary of original mesh
+        cutpairs = [pair for pair in cutpairs if pair not in og_cutpairs]
+
+        # Unit test: all cutpairs need to index valid edges
+        for pair in cutpairs:
+            assert pair in meshetovpair.keys(), f"{pair} not in original mesh edges"
+
+        cut_vpairs.extend(cutpairs)
+
+    return cut_vpairs
+
 def normalize_uv(uv):
     # Center at origin
     uv -= torch.mean(uv.reshape(-1, 2), dim=0).detach()
     # Scale to 0.5 circle
     uv /= 2 * torch.max(torch.linalg.norm(uv.reshape(-1, 2), dim=1)).detach()
+
+def center_inplace(uv):
+    # Add up signed volume of tetrahedra for each face
+    # If triangles, then one of these vertices is the origin
+    uv -= torch.mean(uv.reshape(-1, 2), dim=0).detach()
+
+def matmul_inplace(uv, R):
+    uv @= R
 
 def fix_orientation(vertices, faces):
     from igl import bfs_orient
@@ -33,6 +82,29 @@ def fix_orientation(vertices, faces):
     if volume < 0:
         new_faces = np.fliplr(new_faces)
     return new_faces
+
+def is_locked(filepath):
+    locked = None
+    file_object = None
+    if os.path.exists(filepath):
+        try:
+            buffer_size = 8
+            # Opening file in append mode and read the first 8 characters.
+            file_object = open(filepath, 'a', buffer_size)
+            if file_object:
+                locked = False
+        except IOError as e:
+            print(e)
+            locked = True
+        finally:
+            if file_object:
+                file_object.close()
+    return locked
+
+def wait_for_file(filepath):
+    wait_time = 1
+    while is_locked(filepath):
+        time.sleep(wait_time)
 
 def signed_volume(v, f):
     # Add up signed volume of tetrahedra for each face
@@ -80,22 +152,6 @@ def intersectionloss(points, checktri):
 
 ## ==============================================
 
-# Pytorch: from UVs back out Jacobian matrices per face using local coordinates per triangle
-# NOTE: uvtri input must be PER triangle
-def get_jacobian(uvtri, local_tris):
-    x = local_tris[:,:,0]
-    y = local_tris[:,:,1]
-
-    # NOTE: Below only valid when local tris maps the first vertex to (0,0)!!!
-    d = (x[:, 1] * y[:, 2]).reshape(len(x), 1)
-
-    # Construct J
-    Jx = torch.column_stack([y[:, 1] - y[:, 2], y[:, 2] - y[:, 0], y[:, 0] - y[:, 1]])
-    Jy = torch.column_stack([x[:, 2] - x[:, 1], x[:, 0] - x[:, 2], x[:, 1] - x[:, 0]])
-    J = torch.matmul(torch.stack([Jx, Jy], dim=1), uvtri) * 1/d # F x 2 x 2
-
-    return J
-
 # Get Tutte embedding from IGL
 def tutte_embedding(vertices, faces):
     import igl
@@ -110,11 +166,7 @@ def tutte_embedding(vertices, faces):
     ## Harmonic parametrization for the internal vertices
     assert not np.isnan(bnd).any(), f"NaN found in boundary loop!"
     assert not np.isnan(bnd_uv).any(), f"NaN found in tutte initialized UVs!"
-<<<<<<< HEAD
-    uv_init = igl.harmonic(vertices, faces, bnd, bnd_uv, 1)
-=======
     uv_init = igl.harmonic(vertices, faces, bnd, np.array(bnd_uv, dtype=vertices.dtype), 1)
->>>>>>> 60fceb377cf18cd8753f89d8926271042f5e00a2
 
     return uv_init, bnd, bnd_uv
 
@@ -165,6 +217,17 @@ def get_local_tris(vertices, faces, basis=None, device=torch.device("cpu")):
 
 
     return local_tris
+
+# Register pointset A to pointset B by centering then procrustes with inplace operations
+def register_2d(A, B):
+    # Center pointsets
+    A -= torch.mean(A, dim=0)
+    B -= torch.mean(B, dim=0)
+
+    M = A.T @ B
+    u, s, vt = np.linalg.svd(M)
+    R = u @ vt
+    new_uvs = A @ R
 
 # Return updated stitched soupvs, soupfs based on original topology (vs, fs) and epsilon
 # NOTE: fs and soupfs MUST be in correspondence!
@@ -1062,25 +1125,38 @@ def cut_to_disk_single(mesh, singular_vs, verbose=False):
             print(f"Mesh became non-manifold from cuts!")
             break
 
-def SLIM(mesh, iters=500, v_with_holes = None, f_with_holes = None):
+def SLIM(vertices, faces, iters = 500, energy='sd', threshold=4.01):
     # SLIM parameterization
     # Initialize using Tutte embedding
     import igl
     from meshing.mesh import Mesh
 
-    vs, fs, _ = mesh.export_soup()
-    uv_init, bnd, bnd_uv = tutte_embedding(vs, fs)
+    vertices = vertices.astype(np.double)
+    uv_init, bnd, bnd_uv = tutte_embedding(vertices, faces)
 
     # Need to subset back non-disk topology if filled hole
-    if v_with_holes is not None and f_with_holes is not None:
-        # Only select UVs relevant to the
-        uv_init = uv_init[v_with_holes]
-        sub_faces = fs[f_with_holes]
-        # NOTE: vertices should now be indexed in the same way as the original sub_faces
-        submesh = Mesh(uv_init, sub_faces)
-        vs, fs, _ = submesh.export_soup()
+    # if v_with_holes is not None and f_with_holes is not None:
+    #     # Only select UVs relevant to the
+    #     uv_init = uv_init[v_with_holes]
+    #     sub_faces = fs[f_with_holes]
+    #     # NOTE: vertices should now be indexed in the same way as the original sub_faces
+    #     submesh = Mesh(uv_init, sub_faces)
+    #     vs, fs, _ = submesh.export_soup()
 
-    slim = igl.SLIM(vs, fs, uv_init, bnd, bnd_uv, igl.SLIM_ENERGY_TYPE_ARAP, 0.0)
+    if energy == "sd":
+        iglenergy = igl.SLIM_ENERGY_TYPE_SYMMETRIC_DIRICHLET
+    elif energy == "arap":
+        iglenergy = igl.SLIM_ENERGY_TYPE_ARAP
+    elif energy == "larap":
+        iglenergy = igl.SLIM_ENERGY_TYPE_LOG_ARAP
+    elif energy == "conformal":
+        iglenergy = igl.SLIM_ENERGY_TYPE_CONFORMAL
+    elif energy == "econformal":
+        iglenergy = igl.SLIM_ENERGY_TYPE_EXP_CONFORMAL
+    elif energy == "esd":
+        iglenergy = igl.SLIM_ENERGY_TYPE_EXP_SYMMETRIC_DIRICHLET
+
+    slim = igl.SLIM(vertices, faces, uv_init, bnd, bnd_uv, iglenergy, threshold)
     slim.solve(iters)
     slim_uv = slim.vertices()
     slim_uv -= slim_uv.mean(axis = 0)
@@ -1201,7 +1277,7 @@ def get_jacobian_torch(vs, fs, uvmap, device=torch.device('cpu')):
 def get_jacobian(vs, fs, uvmap):
     # Visualize distortion
     from igl import grad
-    G = grad(vs, fs).todense()
+    G = np.array(grad(vs, fs).todense())
 
     # NOTE: currently gradient is organized as X1, X2, X3, ... Y1, Y2, Y3, ... Z1, Z2, Z3 ... resort to X1, Y1, Z1, ...
     splitind = G.shape[0]//3
@@ -1210,8 +1286,6 @@ def get_jacobian(vs, fs, uvmap):
     newG[1::3] = G[splitind:2*splitind]
     newG[2::3] = G[2*splitind:]
 
-    from scipy import sparse
-    newG = sparse.csc_matrix(newG)
     J = (newG @ uvmap).reshape(-1, 3, 2).transpose(0,2,1) # F x 2 x 3
     return J
 
@@ -1400,32 +1474,6 @@ def get_flipped_triangles(vertices, faces):
 
     return flipped
 
-class DifferentiableThreshold(torch.autograd.Function):
-    """
-    In the forward pass this operation behaves like a threshold (> epsilon => 1, else 0).
-    But in the backward pass its gradient is 1 everywhere the threshold is passed.
-    """
-
-    @staticmethod
-    # @custom_fwd
-    def forward(ctx, input, min, max):
-        return input.clamp(min=min, max=max)
-
-    @staticmethod
-    # @custom_bwd
-    def backward(ctx, grad_output):
-        return grad_output.clone(), None, None
-
-
-def dclamp(input, min, max):
-    """
-    Like torch.clamp, but with a constant 1-gradient.
-    :param input: The input that is to be clamped.
-    :param min: The minimum value of the output.
-    :param max: The maximum value of the output.
-    """
-    return DifferentiableClamp.apply(input, min, max)
-
 class DifferentiableClamp(torch.autograd.Function):
     """
     In the forward pass this operation behaves like torch.clamp.
@@ -1442,7 +1490,6 @@ class DifferentiableClamp(torch.autograd.Function):
     def backward(ctx, grad_output):
         return grad_output.clone(), None, None
 
-
 def dclamp(input, min, max):
     """
     Like torch.clamp, but with a constant 1-gradient.
@@ -1451,3 +1498,77 @@ def dclamp(input, min, max):
     :param max: The maximum value of the output.
     """
     return DifferentiableClamp.apply(input, min, max)
+
+
+##### MeshCNN stuf
+def build_gemm(mesh, faces, face_areas):
+    """
+    gemm_edges: array (#E x 4) of the 4 one-ring neighbors for each edge
+    sides: array (#E x 4) indices (values of: 0,1,2,3) indicating where an edge is in the gemm_edge entry of the 4 neighboring edges
+    for example edge i -> gemm_edges[gemm_edges[i], sides[i]] == [i, i, i, i]
+    """
+    mesh.ve = [[] for _ in mesh.vs]
+    edge_nb = []
+    sides = []
+    edge2key = dict()
+    edges = []
+    edges_count = 0
+    nb_count = []
+    for face_id, face in enumerate(faces):
+        faces_edges = []
+        for i in range(3):
+            cur_edge = (face[i], face[(i + 1) % 3])
+            faces_edges.append(cur_edge)
+        for idx, edge in enumerate(faces_edges):
+            edge = tuple(sorted(list(edge)))
+            faces_edges[idx] = edge
+            if edge not in edge2key:
+                edge2key[edge] = edges_count
+                edges.append(list(edge))
+                edge_nb.append([-1, -1, -1, -1])
+                sides.append([-1, -1, -1, -1])
+                mesh.ve[edge[0]].append(edges_count)
+                mesh.ve[edge[1]].append(edges_count)
+                mesh.edge_areas.append(0)
+                nb_count.append(0)
+                edges_count += 1
+            mesh.edge_areas[edge2key[edge]] += face_areas[face_id] / 3
+        for idx, edge in enumerate(faces_edges):
+            edge_key = edge2key[edge]
+            edge_nb[edge_key][nb_count[edge_key]] = edge2key[faces_edges[(idx + 1) % 3]]
+            edge_nb[edge_key][nb_count[edge_key] + 1] = edge2key[faces_edges[(idx + 2) % 3]]
+            nb_count[edge_key] += 2
+        for idx, edge in enumerate(faces_edges):
+            edge_key = edge2key[edge]
+            sides[edge_key][nb_count[edge_key] - 2] = nb_count[edge2key[faces_edges[(idx + 1) % 3]]] - 1
+            sides[edge_key][nb_count[edge_key] - 1] = nb_count[edge2key[faces_edges[(idx + 2) % 3]]] - 2
+    mesh.edges = np.array(edges, dtype=np.int32)
+    mesh.gemm_edges = np.array(edge_nb, dtype=np.int64)
+    mesh.sides = np.array(sides, dtype=np.int64)
+    mesh.edges_count = edges_count
+    mesh.edge_areas = np.array(mesh.edge_areas, dtype=np.float32) / np.sum(face_areas) #todo whats the difference between edge_areas and edge_lenghts?
+    mesh.edge2key = edge2key
+
+def remove_non_manifolds(mesh, faces, face_areas):
+    mesh.ve = [[] for _ in mesh.vs]
+    edges_set = set()
+    mask = np.ones(len(faces), dtype=bool)
+    for face_id, face in enumerate(faces):
+        if face_areas[face_id] == 0:
+            mask[face_id] = False
+            continue
+        faces_edges = []
+        is_manifold = False
+        for i in range(3):
+            cur_edge = (face[i], face[(i + 1) % 3])
+            if cur_edge in edges_set:
+                is_manifold = True
+                break
+            else:
+                faces_edges.append(cur_edge)
+        if is_manifold:
+            mask[face_id] = False
+        else:
+            for idx, edge in enumerate(faces_edges):
+                edges_set.add(edge)
+    return faces[mask], face_areas[mask]

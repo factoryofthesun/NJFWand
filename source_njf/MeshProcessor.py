@@ -1,7 +1,5 @@
 from multiprocessing import process
 import warnings
-warnings.filterwarnings("ignore")
-
 
 from scipy.sparse import load_npz, save_npz
 from PoissonSystem import poisson_system_matrices_from_mesh, PoissonSystemMatrices, SparseMat
@@ -37,7 +35,7 @@ class MeshProcessor:
 
         self.ttype = ttype
         self.num_samples = NUM_SAMPLES
-        self.vertices = vertices.squeeze()
+        self.vertices = vertices.squeeze().astype(np.float64)
         self.faces = faces.squeeze()
         self.normals =  igl.per_vertex_normals(self.vertices, self.faces)
         # self.__use_wks = use_wks
@@ -75,7 +73,7 @@ class MeshProcessor:
     @staticmethod
     def meshprocessor_from_directory(source_dir, ttype, cpuonly=False, load_wks_samples=False, load_wks_centroids=False,
                                      top_k_eig=50, softpoisson=False, sparse=True):
-        vertices = np.load(os.path.join(source_dir, "vertices.npy"))
+        vertices = np.load(os.path.join(source_dir, "vertices.npy")).astype(np.float64)
         faces = np.load(os.path.join(source_dir, "faces.npy"))
         return MeshProcessor(vertices,faces,ttype,source_dir, cpuonly=cpuonly, load_wks_samples=load_wks_samples,
                              load_wks_centroids=load_wks_centroids, compute_splu=False, top_k_eig=top_k_eig,
@@ -90,6 +88,7 @@ class MeshProcessor:
             V,F,_ = igl.read_off(fname)
         elif fname[-4:] == '.ply':
             V,F = igl.read_triangle_mesh(fname)
+        V = V.astype(np.float64)
         return MeshProcessor(V,F,ttype,os.path.dirname(fname),True, cpuonly=cpuonly, load_wks_samples=load_wks_samples,
                              load_wks_centroids=load_wks_centroids, compute_splu=False, top_k_eig=top_k_eig,
                              softpoisson=softpoisson, sparse=sparse)
@@ -159,7 +158,6 @@ class MeshProcessor:
                     self.load_centroids()
                 except Exception as e:
                     self.compute_centroids()
-                    # self.save_centroids() # centroid WKS and samples WKS are intertwined right now and you cannot really use one without the other. So this is redondont with function save_samples
         return self.centroids
 
     def compute_centroids(self):
@@ -301,12 +299,26 @@ class MeshProcessor:
         else:
             raise RuntimeError("wrong file type")
 
-    def computeWKS(self):
-        if self.faces_wks is  None or self.vert_wks is  None:
+    def computeWKS(self, vs = None, fs = None):
+        if vs is not None and fs is not None:
+            st = time()
+            w = WaveKernelSignature(vs, fs, top_k_eig=self.top_k_eig)
+
+            w.compute()
+            wk = w.wks
+            faces_wks = np.zeros((fs.shape[0], wk.shape[1]))
+            for i in range(3):
+                faces_wks += wk[fs[:, i], :]
+            faces_wks /= 3
+            self.faces_wks = faces_wks
+            self.vert_wks = wk
+            assert (self.faces_wks.shape[0] == fs.shape[0])
+            assert (self.vert_wks.shape[0] == vs.shape[0])
+
+        elif self.faces_wks is None or self.vert_wks is None:
             st = time()
             w = WaveKernelSignature(self.vertices, self.faces, top_k_eig=self.top_k_eig)
             w.compute()
-            print(f"Ellapsed {time() - st}")
             wk = w.wks
             faces_wks = np.zeros((self.faces.shape[0], wk.shape[1]))
             for i in range(3):
@@ -316,7 +328,6 @@ class MeshProcessor:
             self.vert_wks = wk
             assert (self.faces_wks.shape[0] == self.faces.shape[0])
             assert (self.vert_wks.shape[0] == self.vertices.shape[0])
-
 
     def sample_points(self, n):
         bary, found_faces, sampled_points = igl.random_points_on_mesh(n, self.vertices, self.faces)
@@ -409,18 +420,33 @@ class WaveKernelSignature:
         '''
         compute the wks. Afterwards WKS stores in self.wks
         '''
+        # NOTE: This will still work even with disconnected components
         cp = igl.connected_components(igl.adjacency_matrix(self.faces))
-        assert(cp[0]==1), f"{cp}"
+        # assert(cp[0]==1), f"{cp}"
         L = -igl.cotmatrix(self.vertices, self.faces) # this is fast 0.04 seconds
         M = igl.massmatrix(self.vertices, self.faces, igl.MASSMATRIX_TYPE_VORONOI)
+
+        ## Fix L using grad method if there's nonfinite values
+        npL = L.toarray()
+        if not np.all(np.isfinite(npL)):
+            grad = igl.grad(self.vertices, self.faces)
+            d_area = igl.doublearea(self.vertices,self.faces)
+            d_area = scipy.sparse.diags(np.hstack((d_area, d_area, d_area)))
+            L = grad.T @ d_area @ grad / 2
+
         # assert(not numpy.any(numpy.isinf(L)))
         try:
             try:
                 self.eig_vals, self.eig_vecs = scipy.sparse.linalg.eigsh(
                     L, self.top_k_eig, M, sigma=0, which='LM', maxiter=self.max_iter)
             except:
+                # NOTE TO CONSIDER: We add small identity factor to prevent singularity issues from small values ??
                 self.eig_vals, self.eig_vecs = scipy.sparse.linalg.eigsh(
                     L, self.top_k_eig, M, sigma=1e-4, which='LM', maxiter=self.max_iter)
+
+                # self.eig_vals, self.eig_vecs = scipy.sparse.linalg.eigsh(
+                #     L + np.identity(L.shape[0]) * 1e-6, self.top_k_eig, M, sigma=1e-4, which='LM', maxiter=self.max_iter)
+
         except Exception as e:
             print(e)
             raise WaveKernelSignatureError("Error in computing WKS")
@@ -481,15 +507,16 @@ class WaveKernelSignature:
         # range between biggest and smallest eigenvalue :
         # 6 0.09622419080119388
         # 6_bis 0.09651935545457718
-        delta = (np.log(self.eig_vals[-1]) - np.log(self.eig_vals[1])) / self.timestamps
+        # NOTE: To prevent nan we threshold the eigvals
+        delta = (np.log(max(self.eig_vals[-1], 1e-12)) - np.log(max(self.eig_vals[1], 1e-12))) / self.timestamps
         sigma = 7 * delta
-        e_min = np.log(self.eig_vals[1]) + 2 * delta
-        e_max = np.log(self.eig_vals[-1]) - 2 * delta
+        e_min = np.log(max(self.eig_vals[1], 1e-12)) + 2 * delta
+        e_max = np.log(max(self.eig_vals[-1], 1e-12)) - 2 * delta
         es = np.linspace(e_min, e_max, self.timestamps)  # T
         self.delta = delta
 
 
-        coef = np.expand_dims(es, 0) - np.expand_dims(np.log(self.eig_vals[1:]), 1)  # (K-1)xT
+        coef = np.expand_dims(es, 0) - np.expand_dims(np.log(np.maximum(self.eig_vals[1:], 1e-12)), 1)  # (K-1)xT
         coef = np.exp(-np.square(coef) / (2 * sigma * sigma))  # (K-1)xT #element wise square
         sum_coef = coef.sum(0)  # T
         K = np.matmul(np.square(self.eig_vecs[:, 1:]), coef)  # VxT. Scaling of the eigen vectors by coef. Coef depends only on the eigen values. Triangulation agnostic.

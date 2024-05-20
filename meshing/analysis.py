@@ -46,18 +46,18 @@ def computeHKS(mesh, k=128, t=np.array([1])):
     hks = get_hks(vertices, faces, k, t)
     mesh.hks = hks
 
-def computeFaceNormals(mesh):
-    edges1 = []
-    edges2 = []
-    for key, f in sorted(mesh.topology.faces.items()):
-        if f.isBoundaryLoop():
-            continue
-        u = mesh.vector(f.halfedge)
-        v = -1 * mesh.vector(f.halfedge.prev())
-        edges1.append(u)
-        edges2.append(v)
-    n = normalize(np.cross(edges1, edges2, axis=1), axis=1)
-    mesh.facenormals = n
+# def computeFaceNormals(mesh):
+#     edges1 = []
+#     edges2 = []
+#     for key, f in sorted(mesh.topology.faces.items()):
+#         if f.isBoundaryLoop():
+#             continue
+#         u = mesh.vector(f.halfedge)
+#         v = -1 * mesh.vector(f.halfedge.prev())
+#         edges1.append(u)
+#         edges2.append(v)
+#     n = normalize(np.cross(edges1, edges2, axis=1), axis=1)
+#     mesh.facenormals = n
 
 def computeFaceAreas(mesh):
     edges1 = []
@@ -92,11 +92,11 @@ def computeFaceNormals(mesh):
 
 # Mean of adjacent face normals
 def computeVertexNormals(mesh):
-    if not hasattr(mesh, "facenormals"):
+    if not hasattr(mesh, "fnormals"):
         computeFaceNormals(mesh)
     if not hasattr(mesh, "f_to_v"):
         computeFaceToVertex(mesh)
-    n = [np.mean(mesh.facenormals[fvec], axis=0) for fvec in mesh.f_to_v]
+    n = [np.mean(mesh.fnormals[fvec], axis=0) for fvec in mesh.f_to_v]
     mesh.vertexnormals = np.array(n)
 
 # Mean of incident dihedrals

@@ -11,6 +11,7 @@ lightning_logs
 *.polyscope*
 *.png
 *.ini
+OptCuts_bin
 
 # data files
 MeshCNN/checkpoints

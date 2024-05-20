@@ -14,20 +14,18 @@ class UVExperiment(Experiment):
         encoder.add_pointnet(1000, source=True, target=False)
 
 if __name__ == '__main__':
-    import platform
     # Set wandb
     # NOTE: WANDB_DIR MUST EXIST
-    if platform.system() == "Darwin":
-        pass
-    else:
-        os.environ['WANDB_DIR'] = "/net/scratch/rliu/.cache/wandb"
-        os.environ['WANDB_CACHE_DIR'] = "/net/scratch/rliu/.cache/wandb"
-        os.environ['WANDB_DATA_DIR'] = "/net/scratch/rliu/.cache/wandb"
+    if not os.path.exists("/net/scratch/rliu/.cache/wandb"):
+        raise ValueError("/net/scratch/rliu/.cache/wandb must exist")
 
-        # Wandb prune cache
-        import wandb
-        c = wandb.wandb_sdk.wandb_artifacts.get_artifacts_cache()
-        c.cleanup(int(1e6))
+    os.environ['WANDB_DIR'] = "/net/scratch/rliu/.cache/wandb"
+    os.environ['WANDB_CACHE_DIR'] = "/net/scratch/rliu/.cache/wandb"
+    os.environ['WANDB_DATA_DIR'] = "/net/scratch/rliu/.cache/wandb"
+    # Wandb prune cache
+    import wandb
+    c = wandb.wandb_sdk.wandb_artifacts.get_artifacts_cache()
+    c.cleanup(int(1e7))
 
     #this parses the command line arguments and then trains on the given dataset with the given experiment
     args = args_from_cli.parse_args()

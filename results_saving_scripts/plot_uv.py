@@ -6,6 +6,29 @@ import numpy as np
 import os
 import fresnel
 
+def plot_texture(savefile, pred_vertices, triangles, img,
+                 name, linewidth=0.3,
+                 xmin=0, xmax=1, ymin=0, ymax=1,
+            ):
+    """ Plot UV overlaid on texture image """
+    # First center the predicted vertices
+    tris = Triangulation(pred_vertices[:, 0], pred_vertices[:, 1], triangles=triangles)
+    fig, axs = plt.subplots(figsize=(10, 10))
+
+    # Plot image
+    # axs.set_xlim(xmin, xmax)
+    # axs.set_ylim(ymin, ymax)
+    implot = axs.imshow(img, origin='lower', extent=[xmin, xmax, ymin, ymax])
+
+    # plot ours
+    axs.set_title(name, fontsize=14)
+    axs.triplot(tris, 'k-', linewidth=linewidth)
+
+    plt.axis('off')
+    axs.axis('equal')
+    plt.savefig(savefile)
+    plt.close()
+
 def plot_uv(path, name, pred_vertices, triangles, gt_vertices=None, losses=None, cmin=0, cmax=2,
             stitchweight=0.1, dmin=0, dmax=1,
             facecolors = None, edges = None, edgecolors = None, source = None, valid_edges_to_soup = None,
@@ -23,45 +46,37 @@ def plot_uv(path, name, pred_vertices, triangles, gt_vertices=None, losses=None,
         facecolors=np.ones(len(triangles)) * 0.5
 
     fname = "_".join(name.split())
-    if gt_vertices:
-        fig, axs = plt.subplots(1,2,figsize=(15, 4))
-        fig.suptitle(name)
 
-        # plot GT
-        axs[0].set_title('GT')
-        axs[0].axis('equal')
+    fig, axs = plt.subplots(figsize=(3, 3))
+    # plot ours
+    axs.set_title(name)
 
-        gt_tris = Triangulation(gt_vertices[:,0], gt_vertices[:,1], triangles)
-        axs[0].triplot(gt_tris, linewidth=0.1)
-
-        # plot ours
-        axs[1].set_title('Ours')
-        axs[1].axis('equal')
-        # axs[1].set_axis_off()
-
-        axs[1].triplot(tris, linewidth=0.1)
-        plt.axis('off')
-        plt.savefig(os.path.join(path, f"{fname}.png"))
-        plt.close(fig)
-        plt.cla()
+    # If manual rgb colors, then hack with below
+    if len(facecolors.shape) > 1:
+        from matplotlib.collections import PolyCollection
+        colors = facecolors
+        maskedTris = tris.get_masked_triangles()
+        verts = np.stack((tris.x[maskedTris], tris.y[maskedTris]), axis=-1)
+        collection = PolyCollection(verts)
+        collection.set_facecolor(colors)
+        axs.add_collection(collection)
+        axs.autoscale_view()
     else:
-        fig, axs = plt.subplots(figsize=(5, 5))
-        # plot ours
-        axs.set_title(name)
         axs.tripcolor(tris, facecolors=facecolors, cmap=cmap,
                             linewidth=0.1, edgecolor="black")
 
-        # Plot edges if given
-        if edges is not None and len(edges) > 0:
-            for i, e in enumerate(edges):
-                axs.plot(e[:, 0], e[:, 1], marker='none', linestyle='-',
-                         color=edge_cmap(edgecolors[i]) if edgecolors is not None else "black", linewidth=1.5)
+    plt.axis('off')
+    axs.axis('equal')
+    plt.savefig(os.path.join(path, f"{fname}.png"))
 
-        plt.axis('off')
-        axs.axis('equal')
-        plt.savefig(os.path.join(path, f"{fname}.png"))
-        plt.close(fig)
-        plt.cla()
+    # Plot edges if given
+    if edges is not None and len(edges) > 0:
+        for i, e in enumerate(edges):
+            axs.plot(e[:, 0], e[:, 1], marker='none', linestyle='-',
+                        color=edge_cmap(edgecolors[i]) if edgecolors is not None else "black", linewidth=1.5)
+
+        plt.savefig(os.path.join(path, f"{fname}_edges.png"))
+    plt.clf()
 
     # # NOTE: this only works with WandbLogger
     # if logger is not None:
@@ -79,7 +94,7 @@ def plot_uv(path, name, pred_vertices, triangles, gt_vertices=None, losses=None,
                     valid_pairs = source.valid_pairs
                     separationloss = val
 
-                    fig, axs = plt.subplots(figsize=(5,5))
+                    fig, axs = plt.subplots(figsize=(3, 3))
                     fig.suptitle(f"Total Vertex Loss: {np.sum(separationloss):0.8f}")
                     cmap = plt.get_cmap("Reds")
 
@@ -102,16 +117,10 @@ def plot_uv(path, name, pred_vertices, triangles, gt_vertices=None, losses=None,
                     axs.tripcolor(tris, vseplosses, cmap=cmap, shading='gouraud',
                     linewidth=0.5, vmin=0, vmax=0.2, edgecolor='black')
 
-                    # Plot edges if given
-                    if edges is not None and len(edges) > 0:
-                        for i, e in enumerate(edges):
-                            axs.plot(e[:, 0], e[:, 1], marker='none', linestyle='-',
-                                        color=edge_cmap(edgecolors[i]) if edgecolors is not None else "black", linewidth=1.5)
-
                     plt.axis('off')
                     axs.axis("equal")
                     plt.savefig(os.path.join(path, f"{key}_{fname}.png"), bbox_inches='tight', dpi=600)
-                    plt.close()
+                    plt.clf()
 
                 elif key == "edgecutloss":
                     from collections import defaultdict
@@ -120,14 +129,13 @@ def plot_uv(path, name, pred_vertices, triangles, gt_vertices=None, losses=None,
                         print(f"Need to pass in source mesh or edge_vpairs to plot {key}")
                         continue
 
+                    fig, axs = plt.subplots(figsize=(3, 3))
                     edgecutloss = val # E x 1
                     if edge_vpairs is None:
                         edge_vpairs = source.edge_vpairs
                     if keepidxs is not None:
                         edge_vpairs = edge_vpairs[keepidxs]
                     assert len(edgecutloss) == len(edge_vpairs), f"len(edgecutloss) {len(edgecutloss)} != len(edge_vpairs) {len(edge_vpairs)}"
-
-                    fig, axs = plt.subplots(figsize=(5,5))
 
                     if suptitle:
                         fig.suptitle(f"{suptitle}\nTotal Edge Cut Loss: {np.sum(edgecutloss):0.8f}. ")
@@ -139,9 +147,20 @@ def plot_uv(path, name, pred_vertices, triangles, gt_vertices=None, losses=None,
                     scalarmap = cm.ScalarMappable(norm=norm, cmap=cmap)
 
                     # Plot color-coded triangles and color the edges based on losses
-                    facecmap = plt.get_cmap("tab20")
-                    axs.tripcolor(tris, facecolors=facecolors, cmap=facecmap,
-                                    linewidth=0.5, edgecolor='black')
+                    # If manual rgb colors, then hack with below
+                    if len(facecolors.shape) > 1:
+                        from matplotlib.collections import PolyCollection
+                        colors = facecolors
+                        maskedTris = tris.get_masked_triangles()
+                        verts = np.stack((tris.x[maskedTris], tris.y[maskedTris]), axis=-1)
+                        collection = PolyCollection(verts)
+                        collection.set_facecolor(colors)
+                        axs.add_collection(collection)
+                        axs.autoscale_view()
+                    else:
+                        facecmap = plt.get_cmap("tab20")
+                        axs.tripcolor(tris, facecolors=facecolors, cmap=facecmap,
+                                        linewidth=0.5, edgecolor='black')
 
                     # Plot edges with coloring
                     for i in range(len(edgecutloss)):
@@ -158,13 +177,14 @@ def plot_uv(path, name, pred_vertices, triangles, gt_vertices=None, losses=None,
                     plt.axis('off')
                     axs.axis("equal")
                     plt.savefig(os.path.join(path, f"{key}_{fname}.png"), bbox_inches='tight', dpi=600)
-                    plt.close()
+                    plt.clf()
 
                 elif key == "edgegradloss": # E x 2
                     if edgecorrespondences is None:
                         print(f"Need to pass in edge correspondences to plot {key}")
                         continue
 
+                    fig, axs = plt.subplots(figsize=(3, 3))
                     uve1 = []
                     uve2 = []
                     for k, v in sorted(edgecorrespondences.items()):
@@ -174,7 +194,6 @@ def plot_uv(path, name, pred_vertices, triangles, gt_vertices=None, losses=None,
                         uve1.append(pred_vertices[list(v[0])])
                         uve2.append(pred_vertices[list(v[1])])
 
-                    fig, axs = plt.subplots(figsize=(5,5))
                     fig.suptitle(f"Total Edge Grad Loss: {np.sum(val):0.8f}")
                     cmap = plt.get_cmap("Reds")
                     norm = mpl.colors.Normalize(vmin=0, vmax=0.5)
@@ -183,7 +202,7 @@ def plot_uv(path, name, pred_vertices, triangles, gt_vertices=None, losses=None,
 
                     # Plot monotone triangles and color the edges based on losses
                     axs.tripcolor(tris, facecolors=np.ones(len(triangles)) * 0.5, cmap=cmap,
-                                    linewidth=0.5, edgecolor='black')
+                                linewidth=0.5, edgecolor='black')
 
                     # Plot edges if given
                     for i, e in enumerate(uve1):
@@ -197,132 +216,115 @@ def plot_uv(path, name, pred_vertices, triangles, gt_vertices=None, losses=None,
                     plt.axis('off')
                     axs.axis("equal")
                     plt.savefig(os.path.join(path, f"{key}_{fname}.png"), bbox_inches='tight', dpi=600)
-                    plt.close()
+                    plt.clf()
                 elif key == "distortionloss":
-                    fig, axs = plt.subplots(figsize=(5,5))
+
+                    fig, axs = plt.subplots(figsize=(3, 3))
                     fig.suptitle(f"{name}\nAvg {key}: {np.mean(val):0.4f}")
                     cmap = plt.get_cmap("Reds")
                     axs.tripcolor(tris, val[:len(triangles)], facecolors=val[:len(triangles)], cmap=cmap,
                                 linewidth=0.1, vmin=dmin, vmax=dmax, edgecolor="black")
 
-                    # Plot edges if given
-                    if edges is not None and len(edges) > 0:
-                        for i, e in enumerate(edges):
-                            axs.plot(e[:, 0], e[:, 1], marker='none', linestyle='-',
-                                    color=edge_cmap(edgecolors[i]) if edgecolors is not None else "black", linewidth=1.5)
-
                     plt.axis('off')
                     axs.axis("equal")
                     plt.savefig(os.path.join(path, f"{key}_{fname}.png"), bbox_inches='tight',dpi=600)
-                    plt.close()
+                    plt.clf()
                 elif key == "invjloss":
-                    fig, axs = plt.subplots(figsize=(5,5))
+
+                    fig, axs = plt.subplots(figsize=(3, 3))
                     fig.suptitle(f"{name}\nAvg {key}: {np.mean(val):0.4f}")
                     cmap = plt.get_cmap("Reds")
                     axs.tripcolor(tris, val[:len(triangles)], facecolors=val[:len(triangles)], cmap=cmap,
                                 linewidth=0.1, vmin=cmin, vmax=cmax, edgecolor="black")
 
-                    # Plot edges if given
-                    if edges is not None and len(edges) > 0:
-                        for i, e in enumerate(edges):
-                            axs.plot(e[:, 0], e[:, 1], marker='none', linestyle='-',
-                                    color=edge_cmap(edgecolors[i]) if edgecolors is not None else "black", linewidth=1.5)
-
                     plt.axis('off')
                     axs.axis("equal")
                     plt.savefig(os.path.join(path, f"{key}_{fname}.png"), bbox_inches='tight',dpi=600)
-                    plt.close()
+                    plt.clf()
                 elif key == "fliploss":
-                    fig, axs = plt.subplots(figsize=(5,5))
+                    fig, axs = plt.subplots(figsize=(3, 3))
                     fig.suptitle(f"{name}\nAvg {key}: {np.mean(val):0.4f}")
                     cmap = plt.get_cmap("Reds")
                     axs.tripcolor(tris, val[:len(triangles)], facecolors=val[:len(triangles)], cmap=cmap,
                                 linewidth=0.1, vmin=cmin, vmax=cmax, edgecolor="black")
 
-                    # Plot edges if given
-                    if edges is not None and len(edges) > 0:
-                        for i, e in enumerate(edges):
-                            axs.plot(e[:, 0], e[:, 1], marker='none', linestyle='-',
-                                    color=edge_cmap(edgecolors[i]) if edgecolors is not None else "black", linewidth=1.5)
-
                     plt.axis('off')
                     axs.axis("equal")
                     plt.savefig(os.path.join(path, f"{key}_{fname}.png"), bbox_inches='tight',dpi=600)
-                    plt.close()
+                    plt.clf()
                 elif key == "intersectionloss":
-                    fig, axs = plt.subplots(figsize=(5,5))
+                    fig, axs = plt.subplots(figsize=(3, 3))
                     fig.suptitle(f"{name}\nAvg {key}: {np.mean(val):0.4f}")
                     cmap = plt.get_cmap("Reds")
                     axs.tripcolor(tris, val[:len(triangles)], facecolors=val[:len(triangles)], cmap=cmap,
                                 linewidth=0.1, vmin=cmin, vmax=cmax, edgecolor="black")
 
-                    # Plot edges if given
-                    if edges is not None and len(edges) > 0:
-                        for i, e in enumerate(edges):
-                            axs.plot(e[:, 0], e[:, 1], marker='none', linestyle='-',
-                                    color=edge_cmap(edgecolors[i]) if edgecolors is not None else "black", linewidth=1.5)
-
                     plt.axis('off')
                     axs.axis("equal")
                     plt.savefig(os.path.join(path, f"{key}_{fname}.png"), bbox_inches='tight',dpi=600)
-                    plt.close()
+                    plt.clf()
                 elif key == "gtuvloss":
-                    fig, axs = plt.subplots(figsize=(5,5))
+                    fig, axs = plt.subplots(figsize=(3, 3))
                     fig.suptitle(f"Average GT Loss: {np.mean(val):0.8f}")
                     cmap = plt.get_cmap("Reds")
 
                     axs.tripcolor(tris, val, cmap=cmap,
                                 linewidth=0.1, vmin=0, vmax=1, edgecolor='black')
 
-                    # Plot edges if given
-                    if edges is not None and len(edges) > 0:
-                        for i, e in enumerate(edges):
-                            axs.plot(e[:, 0], e[:, 1], marker='none', linestyle='-',
-                                        color=edge_cmap(edgecolors[i]) if edgecolors is not None else "black", linewidth=1.5)
+                    plt.axis('off')
+                    axs.axis("equal")
+                    plt.savefig(os.path.join(path, f"{key}_{fname}.png"), bbox_inches='tight', dpi=600)
+                    plt.clf()
+                elif key == "uvrangeloss":
+                    fig, axs = plt.subplots(figsize=(3, 3))
+                    fig.suptitle(f"Average UV Range Loss: {np.mean(val):0.8f}")
+                    cmap = plt.get_cmap("Reds")
+
+                    axs.tripcolor(tris, val, cmap=cmap,
+                                linewidth=0.1, vmin=0, vmax=1, edgecolor='black')
 
                     plt.axis('off')
                     axs.axis("equal")
                     plt.savefig(os.path.join(path, f"{key}_{fname}.png"), bbox_inches='tight', dpi=600)
-                    plt.close()
+                    plt.clf()
+                elif key == "uvlogloss":
+                    fig, axs = plt.subplots(figsize=(3, 3))
+                    fig.suptitle(f"Average UV Log Loss: {np.mean(val):0.8f}")
+                    cmap = plt.get_cmap("Reds")
+
+                    axs.tripcolor(tris, val, cmap=cmap,
+                                linewidth=0.1, vmin=0, vmax=1, edgecolor='black')
+
+                    plt.axis('off')
+                    axs.axis("equal")
+                    plt.savefig(os.path.join(path, f"{key}_{fname}.png"), bbox_inches='tight', dpi=600)
+                    plt.clf()
                 elif key == "normalloss":
-                    fig, axs = plt.subplots(figsize=(5,5))
+                    fig, axs = plt.subplots(figsize=(3, 3))
                     fig.suptitle(f"Average Normal Loss: {np.mean(val):0.8f}")
                     cmap = plt.get_cmap("Reds")
 
                     axs.tripcolor(tris, val, cmap=cmap,
                                 linewidth=0.1, vmin=0, vmax=1, edgecolor='black')
 
-                    # Plot edges if given
-                    if edges is not None and len(edges) > 0:
-                        for i, e in enumerate(edges):
-                            axs.plot(e[:, 0], e[:, 1], marker='none', linestyle='-',
-                                        color=edge_cmap(edgecolors[i]) if edgecolors is not None else "black", linewidth=1.5)
-
                     plt.axis('off')
                     axs.axis("equal")
                     plt.savefig(os.path.join(path, f"{key}_{fname}.png"), bbox_inches='tight', dpi=600)
-                    plt.close()
+                    plt.clf()
                 elif key == "gtjloss":
-                    fig, axs = plt.subplots(figsize=(5,5))
+                    fig, axs = plt.subplots(figsize=(3, 3))
                     fig.suptitle(f"Average GT Jacobian Loss: {np.mean(val):0.8f}")
                     cmap = plt.get_cmap("Reds")
 
                     axs.tripcolor(tris, val, cmap=cmap,
                                 linewidth=0.1, vmin=0, vmax=1, edgecolor='black')
 
-                    # Plot edges if given
-                    if edges is not None and len(edges) > 0:
-                        for i, e in enumerate(edges):
-                            axs.plot(e[:, 0], e[:, 1], marker='none', linestyle='-',
-                                        color=edge_cmap(edgecolors[i]) if edgecolors is not None else "black", linewidth=1.5)
-
                     plt.axis('off')
                     axs.axis("equal")
                     plt.savefig(os.path.join(path, f"{key}_{fname}.png"), bbox_inches='tight', dpi=600)
-                    plt.close()
+                    plt.clf()
                 elif key == "gtweightloss":
-                    fig, axs = plt.subplots(figsize=(5,5))
-                    fig.suptitle(f"Average GT Weights Loss: {np.mean(val):0.8f}")
+                    fig, axs = plt.subplots(figsize=(3, 3))
                     cmap = plt.get_cmap("Reds")
 
                     if source is None and edge_vpairs is None:
@@ -336,16 +338,27 @@ def plot_uv(path, name, pred_vertices, triangles, gt_vertices=None, losses=None,
                         edge_vpairs = edge_vpairs[keepidxs]
                     assert len(gtweightloss) == len(edge_vpairs), f"len(gtweightloss) {len(gtweightloss)} != len(edge_vpairs) {len(edge_vpairs)}"
 
-                    fig, axs = plt.subplots(figsize=(5,5))
+                    fig.suptitle(f"Average GT Weights Loss: {np.mean(val):0.8f}")
 
                     cmap = plt.get_cmap("Reds")
                     norm = mpl.colors.Normalize(vmin=0, vmax=1)
                     scalarmap = cm.ScalarMappable(norm=norm, cmap=cmap)
 
                     # Plot color-coded triangles and color the edges based on losses
-                    facecmap = plt.get_cmap("tab20")
-                    axs.tripcolor(tris, facecolors=facecolors, cmap=facecmap,
-                                    linewidth=0.5, edgecolor='black')
+                    # If manual rgb colors, then hack with below
+                    if len(facecolors.shape) > 1:
+                        from matplotlib.collections import PolyCollection
+                        colors = facecolors
+                        maskedTris = tris.get_masked_triangles()
+                        verts = np.stack((tris.x[maskedTris], tris.y[maskedTris]), axis=-1)
+                        collection = PolyCollection(verts)
+                        collection.set_facecolor(colors)
+                        axs.add_collection(collection)
+                        axs.autoscale_view()
+                    else:
+                        facecmap = plt.get_cmap("tab20")
+                        axs.tripcolor(tris, facecolors=facecolors, cmap=facecmap,
+                                        linewidth=0.5, edgecolor='black')
 
                     # Plot edges with coloring
                     for i in range(len(gtweightloss)):
@@ -362,14 +375,15 @@ def plot_uv(path, name, pred_vertices, triangles, gt_vertices=None, losses=None,
                     plt.axis('off')
                     axs.axis("equal")
                     plt.savefig(os.path.join(path, f"{key}_{fname}.png"), bbox_inches='tight', dpi=600)
-                    plt.close()
+                    plt.clf()
                 else:
                     print(f"No visualization code for {key}")
                     continue
-
+    plt.close()
 
 def export_views(vertices, faces, savedir, n=5, n_sample=20, width=150, height=150, plotname="Views", filename="test.png", fcolor_vals=None,
-                 vcolor_vals=None, shading=True, cylinders=None, cylinder_scalars=None, subcylinders=None,
+                 vcolor_vals=None, vcolors=None, shading=True,
+                 cylinders=None, cylinder_scalars=None, subcylinders=None,
                  device="cpu", outline_width=0.005, cmap= plt.get_cmap("Reds"), vmin=0, vmax=1):
     import torch
     import matplotlib as mpl
@@ -428,8 +442,13 @@ def export_views(vertices, faces, savedir, n=5, n_sample=20, width=150, height=1
         mesh.color[:] = fresnel.color.linear(vcolors)
         mesh.material.primitive_color_mix = 1.0
     elif vcolor_vals is not None:
+        # NOTE: must be color for every vertex of triangle soup!!
         vcolors = scalarmap.to_rgba(vcolor_vals)[:,:3]
         mesh.color[:] = fresnel.color.linear(vcolors)
+        mesh.material.primitive_color_mix = 1.0
+
+    if vcolors is not None:
+        mesh.color[:] = vcolors
         mesh.material.primitive_color_mix = 1.0
 
     scene.lights = fresnel.light.cloudy()
@@ -455,7 +474,7 @@ def export_views(vertices, faces, savedir, n=5, n_sample=20, width=150, height=1
     # Plot and save in matplotlib using imshow
     import matplotlib.pyplot as plt
     # plt.subplots_adjust(wspace=0, hspace=0)
-    fig, axs = plt.subplots(nrows=1, ncols=len(renders), gridspec_kw={'wspace':0, 'hspace':0}, figsize=(15, 4), squeeze=True)
+    fig, axs = plt.subplots(nrows=1, ncols=len(renders), gridspec_kw={'wspace':0, 'hspace':0}, figsize=(8, 3), squeeze=True)
     for i in range(len(renders)):
         render = renders[i]
         if len(renders) == 1:

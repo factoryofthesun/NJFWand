@@ -10,6 +10,7 @@ from DeformationDataset import DeformationDataset
 import os
 import json
 from train_loop import main
+from test_directuv import test_main
 
 class Experiment(ABC):
     '''
@@ -112,18 +113,77 @@ class Experiment(ABC):
         source,targets = self.evaluate_on_source_and_targets_preprocess(source,targets,args,cpuonly)
         return self.evaluate_on_source_and_targets_inference(source,targets,args,cpuonly)
 
+    def get_args_and_test_directuv(self, args):
+        if self.net is not None:
+            warnings.warn("seems like you loaded a network, but are now running training -- FYI, the loaded network is not being used in training (you need to specify the checkpoint in CLI")
+        args = self.modify_args(args)
+        self.args = args
+
+        # Change name based on the cli arg
+        self.name = self.args.expname
+        print(f"directuv args: {args}")
+
+        import re
+        ### Load directedge checkpoint
+        directedge_checkpointdir = os.path.join(self.args.directedge_checkpointdir, "ckpt")
+        assert os.path.exists(directedge_checkpointdir)
+
+        maxepoch = 0
+        maxstep = 0
+        checkpoint = None
+        for file in os.listdir(directedge_checkpointdir):
+            if file.endswith(".ckpt"):
+                result = re.search(r"epoch=(\d+)-step=(\d+)", file)
+                epoch = int(result.group(1))
+                step = int(result.group(2))
+
+                if epoch > maxepoch:
+                    maxepoch = epoch
+                    maxstep = step
+                    checkpoint = os.path.join(directedge_checkpointdir, file)
+                elif epoch == maxepoch and step > maxstep:
+                    maxstep = step
+                    checkpoint = os.path.join(directedge_checkpointdir, file)
+
+        if checkpoint is not None and os.path.exists(checkpoint):
+            print(f'************************** STARTING TRAINING FROM CHECKPOINT {checkpoint}' )
+            dedge_ckpt = checkpoint
+        else:
+            raise ValueError(f"No checkpoint found at {directedge_checkpointdir}!")
+
+
+        ### Load directuv checkpoint
+        directuv_checkpointdir = os.path.join(self.args.directuv_checkpointdir, 'ckpt')
+        assert os.path.exists(directuv_checkpointdir)
+
+        maxepoch = 0
+        maxstep = 0
+        checkpoint = None
+        for file in os.listdir(directuv_checkpointdir):
+            if file.endswith(".ckpt"):
+                result = re.search(r"epoch=(\d+)-step=(\d+)", file)
+                epoch = int(result.group(1))
+                step = int(result.group(2))
+
+                if epoch > maxepoch:
+                    maxepoch = epoch
+                    maxstep = step
+                    checkpoint = os.path.join(directuv_checkpointdir, file)
+                elif epoch == maxepoch and step > maxstep:
+                    maxstep = step
+                    checkpoint = os.path.join(directuv_checkpointdir, file)
+
+        if checkpoint is not None and os.path.exists(checkpoint):
+            print(f'************************** STARTING TRAINING FROM CHECKPOINT {checkpoint}' )
+            duv_ckpt = checkpoint
+        else:
+            raise ValueError(f"No checkpoint found at {directuv_checkpointdir}!")
+
+        test_main(dedge_ckpt, duv_ckpt, args)
+
     def get_args_and_train(self, args):
         if self.net is not None:
             warnings.warn("seems like you loaded a network, but are now running training -- FYI, the loaded network is not being used in training (you need to specify the checkpoint in CLI")
-        if args.compute_human_data_on_the_fly:
-            # otherwize there is an issue in the workers. They can't all initialize CUDA.
-            try:
-                import multiprocessing
-                multiprocessing.set_start_method("spawn")
-                import torch
-                torch.multiprocessing.set_start_method('spawn')
-            except:
-                print("Failed to initialize muttiprocessing but keep going.")
         args = self.modify_args(args)
         self.args = args
 

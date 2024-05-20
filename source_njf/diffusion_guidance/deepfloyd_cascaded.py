@@ -24,18 +24,21 @@ class DiffusionConfig:
     cascaded: bool = True
 
 class DeepFloydCascaded:
-    def __init__(self, cfg: DiffusionConfig=None):
+    def __init__(self, cfg: DiffusionConfig=None, device=None, **kwargs):
         # Set device (cuda or cpu)
-        if torch.cuda.is_available():
-            self.device = torch.device("cuda:0")
-            torch.cuda.set_device(self.device)
+        if device is not None:
+            self.device = device
         else:
-            self.device = torch.device("cpu")
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # If no config passed, use default config
         if cfg is None:
             cfg = DiffusionConfig()
         self.cfg = cfg
+
+        # If kwargs passed, then we use it to set the config params
+        for k, v in kwargs.items():
+            setattr(self.cfg, k, v)
 
         self.weights_dtype = (
             torch.float16 if self.cfg.half_precision_weights else torch.float32
@@ -88,13 +91,7 @@ class DeepFloydCascaded:
         self.stage_II_alphas: torch.FloatTensor = self.stage_II_scheduler.alphas_cumprod.to(self.device)
 
     def encode_prompt(self, prompt: str, negative_prompt: str = None):
-        # The stage you embed with should not matter as both use the same T5 text encoder
-        # if stage == 1:
-        #     prompt_embeds, negative_embeds = self.stage_I_pipe.encode_prompt(prompt, negative_prompt=negative_prompt)
-        # elif stage == 2:
-        #     prompt_embeds, negative_embeds = self.stage_II_pipe.encode_prompt(prompt, negative_prompt=negative_prompt)
-        # else:
-        #     raise ValueError(f"Invalid stage {stage}")
+        # NOTE: Classifier free guidance defaults to True in encode_prompt
         prompt_embeds, negative_embeds = self.stage_I_pipe.encode_prompt(prompt, negative_prompt=negative_prompt)
         if self.cfg.guidance_scale > 1.0:
             self.prompt_embeds = torch.cat([negative_embeds, prompt_embeds])
@@ -106,13 +103,17 @@ class DeepFloydCascaded:
         mask_image = mask_image.unsqueeze(1).repeat_interleave(3, dim=1)
         return (1 - mask_image) * background + mask_image * selection
 
-    def classifier_free_guidance(self, noise_pred, output_channels=3):
+    def classifier_free_guidance(self, noise_pred, output_channels=3, keep_variance=False):
         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
         noise_pred_uncond, _ = noise_pred_uncond.split(output_channels, dim=1)
         noise_pred_text, predicted_variance = noise_pred_text.split(output_channels, dim=1)
         noise_pred = noise_pred_text + self.cfg.guidance_scale * (
             noise_pred_text - noise_pred_uncond
         )
+
+        if keep_variance:
+            noise_pred = torch.cat([noise_pred, predicted_variance], dim=1)
+
         return noise_pred
 
     @torch.cuda.amp.autocast(enabled=False)
@@ -148,6 +149,7 @@ class DeepFloydCascaded:
         prompt_embeds: Optional[str] = None,
         negative_embeds: Optional[str] = None,
         stage: str = "I",
+        tratio = None,
         **kwargs,
     ):
         batch_size = rgb_img.shape[0]
@@ -169,6 +171,10 @@ class DeepFloydCascaded:
                 dtype=torch.long,
                 device=self.device,
             )
+
+            # If given time step ratio, then use that instead
+            if tratio is not None:
+                t = torch.tensor([int(self.stage_I_min_step + tratio * (self.stage_I_max_step + 1 - self.stage_I_min_step))] * batch_size, device=self.device)
 
             # predict the noise residual with unet, NO grad!
             with torch.no_grad():
@@ -260,3 +266,59 @@ class DeepFloydCascaded:
             "grad_norm": grad.norm(),
             "target": target,
         }
+
+    def full_denoise(
+        self,
+        rgb_img: torch.FloatTensor, # Float[Tensor, "B C H W"]
+        prompt_embeds,
+        negative_embeds,
+        stage: str = "I",
+        tratio = None,
+        **kwargs,
+    ):
+
+        if stage == "I":
+            timesteps = 100
+
+            batch_size = rgb_img.shape[0]
+            rgb_img = rgb_img * 2.0 - 1.0  # scale to [-1, 1] to match the diffusion range
+
+            self.prompt_embeds = torch.cat([negative_embeds, prompt_embeds])
+
+            z_0 = F.interpolate(rgb_img, (64, 64), mode="bilinear", align_corners=False)
+            noise = torch.randn_like(z_0)
+            intermediate_images = self.stage_I_scheduler.add_noise(z_0, noise, torch.tensor(100, device=noise.device))
+
+            from tqdm.contrib import tenumerate
+
+            for i, t in tenumerate(range(timesteps)):
+                model_input = (
+                    torch.cat([intermediate_images] * 2)
+                )
+
+                model_input = self.stage_I_scheduler.scale_model_input(model_input, t)
+                noise_pred = self.forward_unet(
+                    model_input,
+                    torch.cat([torch.tensor([t], device=model_input.device)] * 2 * batch_size),
+                    encoder_hidden_states=self.prompt_embeds.repeat_interleave(batch_size, dim=0),
+                    stage="I",
+                )  # (B, 6, 64, 64)
+
+                # Perform classifier free guidance
+                noise_pred = self.classifier_free_guidance(noise_pred, keep_variance=True)
+
+                intermediate_images = self.stage_I_scheduler.step(
+                    noise_pred, t, intermediate_images, return_dict=False
+                )[0]
+
+            return intermediate_images
+
+        elif stage == "II":
+            image = self.stage_II_pipe(
+                image=rgb_img,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_embeds,
+                output_type="pt",
+            ).images
+
+            return image

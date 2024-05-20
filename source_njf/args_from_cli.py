@@ -36,14 +36,27 @@ def get_arg_parser():
 						type = str, default='outputs')
 
 	### ARCH
-	parser.add_argument('--arch', type=str, choices={'diffusionnet', 'meshcnn', 'mlp'}, help="architecture to use", default='mlp')
+	parser.add_argument('--arch', type=str, choices={'diffusionnet', 'fullconv', 'fullconv2', 'meshcnn', 'mlp', 'directedge', 'directuv'}, help="architecture to use", default='mlp')
 	parser.add_argument('--softpoisson', type=str, choices={'edges', 'valid'}, help="SOFT POISSON", default=None)
+	parser.add_argument('--extrinsic', action='store_true', default=False)
+	parser.add_argument('--hks', action='store_true', default=False)
+	parser.add_argument('--inittopo', action='store_true', default=False)
 	parser.add_argument('--directuv', action="store_true", help='directly predict UVs instead of through poisson')
+	parser.add_argument('--fullconv_share', action='store_true', help="share vertex feature weights in fullconv2", default=False)
 	parser.add_argument('--sparsepoisson', action="store_true")
 	parser.add_argument("--spweight", choices={"nonzero", 'sigmoid', 'seamless', 'cosine', 'softmax'}, type=str,
 						help = "how to map dot product to soft poisson weights", default='sigmoid')
 	parser.add_argument("--softmax", help="softmax the predicted weights",action="store_true")
+	parser.add_argument("--minweight", type=float, help="minimum threshold for sp weight", default=0)
 	parser.add_argument("--fft", type=int,
+							default=0)
+	parser.add_argument("--fftweight", type=int,
+							default=0)
+	parser.add_argument("--fftj", type=int,
+							default=0)
+	parser.add_argument("--fftextrinsic", type=int,
+								default=0)
+	parser.add_argument("--fftuv", type=int,
 							default=0)
 	parser.add_argument("--fftscale", type=int,
 							help='fft scale',
@@ -53,12 +66,15 @@ def get_arg_parser():
 								default=32)
 	parser.add_argument("--facedim", type=int,
 								help='face latent dimension',
-								default=3)
+								default=32)
 	parser.add_argument("--noencoder", help="no encoder. TURN THIS ON IF YOU DONT WANT TO TRAIN THE ENCODER",action="store_true")
-
+	parser.add_argument("--pool_res", help = "pooling for meshcnn", default=[],
+						type=int, nargs='+')
 	### TRAINING
 	parser.add_argument("--continuetrain", help='continue training', action="store_true")
 	parser.add_argument("--checkpointdir", help='directory to ckpt if continue train', type = str, default=None)
+	parser.add_argument("--directedge_checkpointdir", help='directory to ckpt if continue train', type = str, default=None)
+	parser.add_argument("--directuv_checkpointdir", help='directory to ckpt if continue train', type = str, default=None)
 	parser.add_argument("--split_train_set", help="split the train set to create a test set",
 						action="store_true")
 	parser.add_argument("--train_percentage",help = "the train/test split in percentage, default is 90",default=90,type=int)
@@ -68,15 +84,20 @@ def get_arg_parser():
 	parser.add_argument("--epochs",help = "number of training epochs",default=2000,type=int)
 	parser.add_argument("--optimizer",choices={"adam", "sgd"}, help='type of optimizer', type = str,default="adam")
 	parser.add_argument("--identity", help='initialize network from identity', action="store_true")
+	parser.add_argument("--optrot", help='gtuvloss: compute best-fit rotation for the predicted uv', action="store_true")
 	parser.add_argument("--globaltrans", help='also predict global translation per shape code', action="store_true")
 	parser.add_argument("--slimiters", type=int, default=500, help="number of iterations to optimize SLIM")
 	parser.add_argument("--init", choices={"tutte", "isometric", "slim", "precut"}, help="initialize 2D embedding", default=None, type=str)
+	parser.add_argument("--normalizeinit", help="normalize the initialization uvs",
+							action="store_true")
 	parser.add_argument("--ninit", type=int, default=1, help="re-initialize this mesh n many times. only valid for isometric initialization. -1 indicates new initialization for EACH load")
 	parser.add_argument("--initrot", action='store_true', help="initialize with random rotation (isometric only)")
 	parser.add_argument("--basistype", choices={"basis", "rot", "global"}, help="how to sample new triangle local basis", default=None, type=str)
 	parser.add_argument("--initjinput", help="use the initialization jacobian as part of input",
 							action="store_true")
 	parser.add_argument("--initweightinput", help="use the initialization weights as part of input",
+							action="store_true")
+	parser.add_argument("--inituvinput", help="use the initialization uvs as part of the input",
 							action="store_true")
 	parser.add_argument("--optweight", help="optimize the weights instead of getting them from network",
 							action="store_true")
@@ -125,30 +146,33 @@ def get_arg_parser():
 	parser.add_argument("--vertex_loss_weight", help="the weight to place on the vertex loss (jacobian loss is unweighted) default = 1.0", default=1.0, type=float)
 
  	###### POSTPROCESS ######
-	parser.add_argument("--hardpoisson", type=str, choices={'loss', 'weight'}, help = "cutting options for hard poisson",
+	parser.add_argument("--hardpoisson", type=str, choices={'uv', 'weight', 'jacobians'}, help = "cutting options for hard poisson",
 						default=None)
 	parser.add_argument("--cuteps", help="epsilon for edge stitching post-process", default=1e-2, type=float)
 	parser.add_argument("--weightcuteps", help="epsilon for edge stitching post-process (for pred weights)", default=1e-2, type=float)
-
-
 	parser.add_argument("--opttrans", help = "predict l0 translation and visualize", action="store_true")
+	parser.add_argument("--undopin", help = "undo pinning translation based on initialization position", action="store_true")
 
 	###### LOSSES ######
 	## NEW Stitching loss framework
 	parser.add_argument("--stitchingloss", help = "choice of stitching losses. can use multiple", default=None,
 						type = str, nargs='+',
-						choices={'vertexseploss', 'edgecutloss', 'edgegradloss'})
+						choices={'vertexseploss', 'edgecutloss', "weightededgecutloss", 'edgegradloss'})
 	parser.add_argument("--stitchdist", help = "type of stitching distance metric", default='l1', type=str,
-						choices={'l1', 'l2'})
+						choices={'l1', 'l2', 'centroid'})
 	parser.add_argument("--stitchweight", choices={'stitchloss', 'softweight', 'softweightdetach'},
 						help = "iterative reweighting of the stitching loss", default=None)
 	parser.add_argument("--ignorei", help = "cone cutting experiment", default=0,
 						type = int)
 	parser.add_argument("--gtuvloss", help="use ground truth uv supervision", action="store_true")
 	parser.add_argument("--gtnetworkloss", help="use ground truth j and weights", action="store_true")
-	parser.add_argument("--gtjloss", help="ground truth jacobian loss", action="store_true")
+	parser.add_argument("--gtedgeloss", help="ground truth weights", action="store_true")
+	parser.add_argument("--gtjacobianloss", help="ground truth jacobian loss", action="store_true")
 	parser.add_argument("--normalloss", help="normal grid loss", action="store_true")
 	parser.add_argument("--normalloss_weight", help="weight for normalloss", default=0.1, type=float)
+	parser.add_argument("--uvrangeloss", help="keeps uvs in 0 - 1", action="store_true")
+	parser.add_argument("--uvrangeloss_weight", type=float, help="weight for uvrangeloss", default=1)
+	parser.add_argument("--uvlogloss", help="keeps uvs in 0 - 1", action="store_true")
 	parser.add_argument("--removecutfromloss", action="store_true")
 
 	# Seamless
@@ -180,9 +204,12 @@ def get_arg_parser():
 	parser.add_argument("--sparsecutsloss", help = "use sparse cuts loss", action="store_true")
 
 	## Distortion loss
-	parser.add_argument("--lossdistortion", help = "choice of distortion loss", default=None, type=str, choices={'arap', 'dirichlet', 'edge'})
+	parser.add_argument("--lossdistortion", help = "choice of distortion loss", default=None, type=str,
+                     choices={'arap', 'dirichlet', 'asap', 'mips', 'confvar'})
 	parser.add_argument("--losscount", help = "counting loss", action="store_true")
 	parser.add_argument("--arapnorm", help = "normalize arap using avg edge len", action="store_true")
+	parser.add_argument("--amips", help = "amips loss (added to confvar)", action="store_true")
+	parser.add_argument("--amips_weight", help = "weight for additional amips loss", type=float, default=0.2)
 
 	# Intersection loss
 	parser.add_argument("--intersectionloss", help = "adjacent triangle intersection loss", action="store_true")
@@ -208,9 +235,38 @@ def get_arg_parser():
 	######
 
  	### SDS
-	parser.add_argument('--sdsloss', type=str, choices={"text2img", "img2img"}, default=None)
-	parser.add_argument('--textureimg', type=str, help="path to texture image", default=None)
-	parser.add_argument('--texturetext', nargs="+", type=str, help="text description", default=None)
+	parser.add_argument('--visualloss', nargs="+", choices={'sds', 'image', 'render'}, type=str,
+						help="list of visual losses to use", default=[])
+	parser.add_argument('--rasterizer', type=str, choices={"kaolin", "nvdgl", "nvdcuda"}, default=None)
+	parser.add_argument('--sdsloss', nargs="+", choices={"text2img", "img2img", 'csd', "controlnet"}, type=str,
+						help="list of sds losses to use", default=[])
+	parser.add_argument('--sdscaption', nargs="+", type=str, help="if set, then overwrite all other texture descriptions",
+                     default=[])
+	parser.add_argument('--csd_minweight', type=float, default=0)
+	parser.add_argument('--csd_maxweight', type=float, default=0.8)
+	parser.add_argument('--sds_max_step_percent', type=float, default=0.98)
+	parser.add_argument('--control_weight', type=float, default=1.)
+	parser.add_argument('--controlcondition', type=str, choices = {'depth', 'canny'}, default="depth")
+	parser.add_argument('--imageloss', action='store_true', default=False)
+	parser.add_argument('--showtexture', action='store_true', help="Plot the texture result even if no visual loss")
+	parser.add_argument('--clipcheckpointing', action='store_true', default=False)
+	parser.add_argument('--sdscheckpointing', action='store_true', default=False)
+	parser.add_argument("--lowmemory",
+						help='low gpu memory mode. use a bunch of hacks while sacrificing runtime',
+							action="store_true")
+	parser.add_argument('--nviews', type=int, default=5)
+	parser.add_argument('--textureimg', nargs="+", type=str, help="list of paths to texture images", default=None)
+	parser.add_argument('--texturename', nargs="+", type=str, help="list of texture names assigned to imgs", default=None)
+	parser.add_argument('--gttex', nargs="+", type=str, help="list of paths to the reference objs for each texture", default=None)
+
+	### Diff Render Parameters ###
+	parser.add_argument('--up', type=str, choices={'x','y','z'}, help="up direction for rendering", default='y')
+	parser.add_argument("--renderresolution", help="render resolution", type=int, default=512)
+	parser.add_argument("--resolution", help="supervision resolution", type=int, default=128)
+	parser.add_argument('--minaddlights', type=int, default=1)
+	parser.add_argument('--maxaddlights', type=int, default=4)
+	parser.add_argument("--randomlights",help = "additional random lights",action="store_true")
+	parser.add_argument("--specular",help = "add specular effects",action="store_true")
 
 	parser.add_argument("--gpu_strategy",help ="default: no op (whatever lightning does by default). ddp: use the ddp multigpu startegy; spawn: use the ddpspawn strategy",default=None,choices={'ddp','ddpspawn', 'cpuonly'})
 	parser.add_argument("--no_validation",help = "skip validation",action="store_true")
@@ -222,6 +278,7 @@ def get_arg_parser():
 	parser.add_argument("--overfit_one_batch", help="overfit a particular batch of the training data",action="store_true")
 	parser.add_argument("--xp_type", help ="only runs the validation",default=None,type=str)
 	parser.add_argument("--test", help="run in test mode", action="store_true")
+	parser.add_argument("--novelinference", help="running inference on data without computing losses", action="store_true")
 	parser.add_argument("--statsonly", help="applies only to test time, only write stats, no viz", action="store_true")
 	parser.add_argument("--random_scale",help="randomly scale the source (source), target (target), both each with their own random scale (both), both with "
 												"the same scale each time (same), or none (none = default)",type=str,default='none',choices={'source','target','both','same','none'})
@@ -239,13 +296,16 @@ def get_arg_parser():
 	parser.add_argument('--store_faces_per_sample',help="store_faces_for_each samples individually",action='store_true')
 	parser.add_argument('--lr_epoch_step', nargs="+", type=int,help="reduce learning rate once within range and once after",default=[30,40])
 	parser.add_argument('--accumulate_grad_batches', type=int,help="accumulate gradients acrosss multiple batches",default=1)
-	parser.add_argument('--shuffle_triangles',type=bool,help="Shuffle triangles before NJF decoder, to avoid that group-norm overfits to a particular triangulation.",default=1)
+	parser.add_argument('--shuffle_triangles',action='store_true',help="Shuffle triangles before NJF decoder, to avoid that group-norm overfits to a particular triangulation.")
 
 	## DEBUGGING
 	parser.add_argument('--mem', action='store_true')
 	parser.add_argument('--debug', action='store_true')
 	parser.add_argument('--overwrite', action='store_true')
 	parser.add_argument('--overwritecache', action='store_true', help='overwrite stored mesh operators')
+	parser.add_argument('--overwriteinit', action='store_true', help='overwrite all initialization variables')
+	parser.add_argument('--noplot', action='store_true', help='dont plot')
+	parser.add_argument('--keepuv', action='store_true', help='fixedvs.npy containing indices of vertices to keep the init UVs for')
 
 	return parser
 

@@ -39,11 +39,10 @@ class DeformationDataset(Dataset):
         self.unique_source = False
 
         self.len_pairs = len(s_and_t)
-        if SHUFFLE_TARGETS_OF_SINGLE_SOURCE:
-            random.shuffle(s_and_t)
+        # if SHUFFLE_TARGETS_OF_SINGLE_SOURCE:
+        #     random.shuffle(s_and_t)
 
         self.source_and_target = None
-        # st =time.time()
         source_target = {}
         for val in s_and_t:
             s = val[0]
@@ -51,15 +50,12 @@ class DeformationDataset(Dataset):
             if s not in source_target:
                 source_target[s] = []
             source_target[s].append(t)
-        # print(f"ellapsed {time.time() -st}")
         if len(source_target) == 1 and args.ninit == 1:
             # This flag will avoid reloading the source at each iteration, since the source is always the same.
             self.unique_source = True
         self.source_and_target = []
 
         # NOTE: duplicate source for however many initializations we need
-        # HACK: If accumulating batch grads need to duplicate as well
-        batchgrads = args.accumulate_grad_batches
         for s,ts in source_target.items():
             chunks = np.split(ts, np.arange(args.targets_per_batch,len(ts),args.targets_per_batch))
             if args.ninit > 0:
@@ -80,6 +76,7 @@ class DeformationDataset(Dataset):
             objpath = join(self.directory, source_index)
             directory_name, basename = os.path.split(objpath)
             source_index = basename
+
             self.source_and_target[ind] = (source_index, source_index)
             directories.append(directory_name)
         self.directory = directories
@@ -92,7 +89,6 @@ class DeformationDataset(Dataset):
         self.star_is_initialized = False
         self.weightsdim = 0
 
-        # HACK: Clear cache if args is set
         if self.args.overwritecache:
             from utils import clear_directory
 
@@ -187,25 +183,33 @@ class DeformationDataset(Dataset):
         return points_s.cpu().numpy(), np.expand_dims(self.human_db_list[dataset_choice].faces, 0), dataset_choice,gender_s,pose_s,shape_s,trans_s
 
     def get_item_default(self,ind):
+        if self.args.debug:
+            import time
+            t0 = time.time()
+
         source = None
         target = None
         # Single source single target
         source_index ,target_index = self.source_and_target[ind]
         directory = self.directory[ind]
 
-        # NOTE: HACK
-        if self.args.accumulate_grad_batches > 1:
-            ind = 0
+        # HACK: New cache for normalized init uvs
+        if self.args.normalizeinit:
+            tmp = source_index[:-4]
+            source_cache = f"{tmp}_norminit_{ind}"
+        else:
+            tmp = source_index[:-4]
+            source_cache = f"{tmp}_{ind}"
 
         for i,target in enumerate(target_index):
             if Path(target).suffix in [ '.obj' , '.off', '.ply']:
                 # NOTE: Below caches the vertices/faces + creates the directory
-                self.obj_to_npy(Path(join(directory, target)), ind)
+                self.obj_to_npy(Path(join(directory, target)), ind, source_cache)
                 target_index[i] = target[:-4]
 
         if Path(source_index).suffix  in [ '.obj' , '.off', '.ply']:
             # NOTE: Below caches the vertices/faces + creates the directory
-            self.obj_to_npy(Path(join(directory, source_index)), ind)
+            self.obj_to_npy(Path(join(directory, source_index)), ind, source_cache)
             source_index = source_index[:-4]
 
         # print(source_index, target_index)
@@ -213,10 +217,12 @@ class DeformationDataset(Dataset):
 
         # ==================================================================
         # LOAD SOURCE
-        if self.source is not None and self.unique_source:
+        # NOTE: We shouldn't have to reload fullconv but meshcnn doesn't fully recover all the unpool attributes!!!
+        if self.source is not None and self.unique_source and self.args.arch != "fullconv":
             source = self.source
         else:
-            source = SourceMesh(self.args, source_index, join(directory, 'cache', f"{source_index}_{ind}"), self.source_keys, scales[True], self.ttype, use_wks = not self.args.no_wks,
+            source = SourceMesh(self.args, source_index, join(directory, 'cache', source_cache), self.source_keys, scales[True],
+                                self.ttype, use_wks = not self.args.no_wks,
                                 random_centering=(self.train and self.args.random_centering),  cpuonly=self.cpuonly, init=self.args.init,
                                 initjinput = self.args.initjinput, fft=self.args.fft, fftscale=self.args.fftscale,
                                 flatten=self.args.dense, debug=self.args.debug, top_k_eig=self.args.top_k_eig)
@@ -231,15 +237,38 @@ class DeformationDataset(Dataset):
                     new_init = True
                 else:
                     new_init = self.args.basistype
-            source.load(new_init= new_init)
+
+            if self.args.debug:
+                import cProfile, pstats, sys
+
+                pr = cProfile.Profile()
+                pr.enable()
+
+                source.load(new_init= new_init)
+
+                pr.disable()
+                ps = pstats.Stats(pr, stream=sys.stdout)
+                ps.sort_stats('cumulative')
+                ps.print_stats(.01)
+            else:
+                source.load(new_init= new_init)
+
             self.source = source
+
+        if self.args.debug:
+            print(f"Time to load source: {time.time() - t0}")
+            t0 = time.time()
 
         # ==================================================================
         # LOAD TARGET
         # HACK: we just set the targets to be exactly same directory as source
-        target = BatchOfTargets(source_index, [join(directory, 'cache', f"{source_index}_{ind}") for i in range(len(target_index))], self.target_keys, scales[False], self.ttype,
+        target = BatchOfTargets(source_index, [join(directory, 'cache', source_cache) for i in range(len(target_index))], self.target_keys, scales[False], self.ttype,
                                 sparse = self.args.sparsepoisson)
         target.load()
+        if self.args.debug:
+            print(f"Time to load target: {time.time() - t0}")
+            t0 = time.time()
+
         return source, target
 
     def check_if_files_exist(self, paths):
@@ -248,12 +277,12 @@ class DeformationDataset(Dataset):
             exist = (exist and path.is_file())
         return exist
 
-    def obj_to_npy(self, path, ind):
+    def obj_to_npy(self, path, ind, cachename):
         from meshing.io import PolygonSoup
         from meshing.mesh import Mesh
         # NOTE: All mesh data should be saved into 'cache'
         directory_name, basename = os.path.split(os.path.join(os.path.splitext(path)[0]))
-        directory = os.path.join(directory_name, "cache", f"{basename}_{ind}")
+        directory = os.path.join(directory_name, "cache", cachename)
 
         if not os.path.exists(join(directory , "vertices.npy")) and not os.path.exists(join(directory, "faces.npy")):
             os.makedirs(directory, exist_ok=True)
@@ -261,7 +290,7 @@ class DeformationDataset(Dataset):
             mesh = Mesh(soup.vertices, soup.indices)
 
             # Normalize mesh
-            mesh.normalize()
+            # mesh.normalize()
 
             np.save(join(directory , "vertices.npy"), mesh.vertices)
             np.save(join(directory , "faces.npy"), mesh.faces)
@@ -293,6 +322,9 @@ class DeformationDataset(Dataset):
 
     def get_point_dim(self):
         return self[0][0].get_point_dim()
+
+    def get_edges(self):
+        return len(self[0][0].edges)
 
     @staticmethod
     def dataset_from_files(source:str, targets:list = [None], source_keys=None, target_keys=None, ttype=None, args=None, cpuonly=False):
